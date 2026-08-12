@@ -1,0 +1,13 @@
+{
+  "slug": "cloud-sync",
+  "name": "Cloud Sync",
+  "tagline": "Configure S3 & major-cloud remotes and sync folders both ways \u2014 rclone-backed, offline-first, nothing dials home.",
+  "categorySlug": "backup-sync",
+  "license": "Apache-2.0",
+  "description": "A friendly, OneDrive-style config front-end for S3 and every major S3-compatible cloud (AWS S3, Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces, MinIO and any custom endpoint). You enter each remote's endpoint, bucket and access keys yourself; the app connects to nothing on its own. Browse buckets, preview changes with a dry run, and sync a local folder up, down or both ways. Backed by rclone when installed, and it degrades gracefully with clear guidance when it is not. Runs locally, no telemetry, no dial-home.",
+  "aiStack": "Python (tkinter + CLI), rclone",
+  "platforms": [
+    "windows"
+  ],
+  "buildEntry": "cloud_sync_app.py"
+}
