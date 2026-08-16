@@ -32,6 +32,14 @@ Aura components: ``AuraButton`` (kind="primary"|"secondary"|"ghost"|"danger"),
 ``Card`` (use ``card.body``), ``ProgressBar``, ``Tooltip(widget, text)``,
 ``SectionLabel`` / ``Heading`` / ``Caption``, ``AuraScrollbar``.
 
+Layout-language tier (see branding/aura-design-system/APP-LAYOUT-LANGUAGE.md):
+``Toolbar`` (content action bar: ``add_button``/``add_search``/``add_separator``
+/``add_right``), ``SearchEntry`` (⌕ + debounce + Escape), ``EmptyState``
+(glyph/illustration + title + caption + one action; per-theme image pair
+auto-switches), ``Dialog`` (modal scaffold with ``body``/``buttons``; settings
+open on Ctrl+,).  ``AuraApp`` adds ``sidebar_body`` (app-owned sidebar area
+under the nav pills) and a collapsible sidebar (``toggle_sidebar()`` / Ctrl+\\).
+
 Modernizing a plain ttk app WITHOUT the scaffold::
 
     root = tk.Tk()
@@ -74,7 +82,7 @@ __all__ = [
     "windows_polish", "AuraApp", "AuraButton", "AuraEntry", "AuraCombo",
     "AuraOption", "AuraTextbox", "AuraScrollbar", "Switch", "SegmentedControl",
     "Card", "ProgressBar", "StatusBar", "Tooltip", "SectionLabel", "Heading",
-    "Caption",
+    "Caption", "Toolbar", "SearchEntry", "EmptyState", "Dialog",
 ]
 
 # =========================================================================
@@ -148,11 +156,16 @@ def _gsettings_scheme():
 def _system_theme():
     """Best-effort OS appearance preference -> 'light' | 'dark'.
 
-    Order: darkdetect (honours org.freedesktop.appearance + the GNOME
-    color-scheme gsettings key on Linux, the registry on Windows, the defaults
-    domain on macOS), then a direct gsettings probe, then a safe 'dark'
-    default.  Never raises; safe under Xvfb / headless CI.
+    Order: the GNOME ``color-scheme`` gsettings key FIRST (it is the signal
+    Quick OS / Aura publishes; some vendored darkdetect builds still read the
+    legacy ``gtk-theme`` name and would report Light forever on AIQuick —
+    field defect, VM round 2026-08-16), then darkdetect (registry on Windows,
+    defaults domain on macOS), then a safe 'dark' default.  Never raises;
+    safe under Xvfb / headless CI.
     """
+    g = _gsettings_scheme()
+    if g:
+        return g
     try:
         if darkdetect is not None:
             t = darkdetect.theme()           # 'Dark' | 'Light' | None
@@ -160,9 +173,6 @@ def _system_theme():
                 return "dark" if str(t).lower().startswith("d") else "light"
     except Exception:
         pass
-    g = _gsettings_scheme()
-    if g:
-        return g
     return "dark"
 
 
@@ -1062,6 +1072,253 @@ class StatusBar(ctk.CTkFrame):
         self._show("", "", "transparent", _pair("muted"))
 
 
+class Toolbar(ctk.CTkFrame):
+    """The content-area action bar — the tier between the header and the
+    content that commercial apps put their daily-use controls in.
+
+    A slim transparent row.  Convention (see APP-LAYOUT-LANGUAGE.md): the
+    primary "new thing" action left-most, then contextual actions; search and
+    view controls on the right.  Helpers::
+
+        tb = aura.Toolbar(parent); tb.pack(fill="x", pady=(0, 10))
+        tb.add_button("＋ New", cmd, kind="primary")
+        tb.add_button("Import", cmd)                  # secondary by default
+        tb.add_separator()
+        search = tb.add_search("Search notes…", on_change=cb)   # right side
+        tb.add_right(widget)                          # any widget, right side
+
+    ``add(widget)`` packs an arbitrary widget on the left.  All helpers return
+    the created widget.
+    """
+
+    HEIGHT = 44
+
+    def __init__(self, master, **kw):
+        kw.setdefault("fg_color", "transparent")
+        kw.setdefault("corner_radius", 0)
+        kw.setdefault("height", self.HEIGHT)
+        super().__init__(master, **kw)
+
+    def add(self, widget, pad=(0, 8)):
+        widget.pack(side="left", padx=pad, pady=4)
+        return widget
+
+    def add_button(self, text, command=None, kind="secondary", width=None,
+                   tooltip=None):
+        kw = {"width": width} if width else {}
+        btn = AuraButton(self, text=text, command=command, kind=kind,
+                         height=32, **kw)
+        btn.pack(side="left", padx=(0, 8), pady=4)
+        if tooltip:
+            Tooltip(btn, tooltip)
+        return btn
+
+    def add_separator(self):
+        sep = ctk.CTkFrame(self, width=1, height=22, corner_radius=0,
+                           fg_color=_pair("border"))
+        sep.pack(side="left", padx=(2, 10), pady=8)
+        return sep
+
+    def add_search(self, placeholder="Search…", on_change=None, width=240):
+        se = SearchEntry(self, placeholder=placeholder, on_change=on_change,
+                         width=width)
+        se.pack(side="right", padx=(8, 0), pady=4)
+        return se
+
+    def add_right(self, widget, pad=(8, 0)):
+        widget.pack(side="right", padx=pad, pady=4)
+        return widget
+
+
+class SearchEntry(ctk.CTkFrame):
+    """The house search field: leading ⌕ glyph, debounced ``on_change(text)``,
+    Escape clears (and fires the callback immediately).
+
+    API: ``get()``, ``set(text)``, ``clear()``, ``focus_set()``.  Apps bind
+    Ctrl+F to ``focus_set()`` per the layout language.
+    """
+
+    def __init__(self, master, placeholder="Search…", on_change=None,
+                 delay=250, width=240, **kw):
+        kw.setdefault("corner_radius", TOKENS["geometry"]["radius_input"])
+        kw.setdefault("fg_color", _pair("field"))
+        kw.setdefault("border_width", 1)
+        kw.setdefault("border_color", _pair("border"))
+        kw.setdefault("height", 34)
+        super().__init__(master, width=width, **kw)
+        self.on_change = on_change
+        self._delay = delay
+        self._job = None
+        self.grid_propagate(False)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self._glyph = ctk.CTkLabel(self, text="⌕", width=14, font=font(13),
+                                   text_color=_pair("muted"))
+        self._glyph.grid(row=0, column=0, sticky="ns", padx=(10, 4))
+        self.entry = ctk.CTkEntry(self, border_width=0, fg_color="transparent",
+                                  placeholder_text=placeholder,
+                                  font=font(role="body"))
+        self.entry.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=2)
+        self.entry.bind("<KeyRelease>", self._schedule, add="+")
+        self.entry.bind("<Escape>", lambda _e: self.clear(), add="+")
+        try:
+            self.entry._entry.bind("<FocusIn>", self._fin, add="+")
+            self.entry._entry.bind("<FocusOut>", self._fout, add="+")
+        except Exception:
+            pass
+
+    def _fin(self, _e=None):
+        try:
+            self.configure(border_width=2, border_color=_pair("accent"))
+        except Exception:
+            pass
+
+    def _fout(self, _e=None):
+        try:
+            self.configure(border_width=1, border_color=_pair("border"))
+        except Exception:
+            pass
+
+    def _schedule(self, _e=None):
+        if self.on_change is None:
+            return
+        if self._job:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+        self._job = self.after(self._delay, self._fire)
+
+    def _fire(self):
+        self._job = None
+        if self.on_change:
+            try:
+                self.on_change(self.get())
+            except Exception:
+                pass
+
+    def get(self):
+        try:
+            return self.entry.get()
+        except Exception:
+            return ""
+
+    def set(self, text):
+        try:
+            self.entry.delete(0, "end")
+            if text:
+                self.entry.insert(0, text)
+        except Exception:
+            pass
+
+    def clear(self):
+        self.set("")
+        self._fire()
+
+    def focus_set(self):  # noqa: A003 - tk convention
+        try:
+            self.entry.focus_set()
+        except Exception:
+            pass
+
+
+class EmptyState(ctk.CTkFrame):
+    """Centered empty-state block: optional illustration, glyph, title,
+    caption and one primary action — the commercial-app convention for
+    "nothing here yet" surfaces.
+
+    ``image`` may be a path or a ``(light_path, dark_path)`` pair; per-theme
+    variants auto-switch with the theme (CTkImage).  Illustrations are
+    optional and degrade silently — a missing file just means glyph-only.
+    """
+
+    def __init__(self, master, glyph="", title="", caption=None,
+                 action_text=None, action=None, image=None, image_size=(300, 200),
+                 **kw):
+        kw.setdefault("fg_color", "transparent")
+        super().__init__(master, **kw)
+        inner = ctk.CTkFrame(self, fg_color="transparent")
+        inner.place(relx=0.5, rely=0.45, anchor="center")
+        self._img = None
+        if image is not None:
+            try:
+                from PIL import Image
+                light, dark = (image if isinstance(image, (tuple, list))
+                               else (image, image))
+                self._img = ctk.CTkImage(light_image=Image.open(light),
+                                         dark_image=Image.open(dark),
+                                         size=image_size)
+                ctk.CTkLabel(inner, image=self._img, text="").pack(pady=(0, 14))
+            except Exception:
+                self._img = None
+        if glyph and self._img is None:
+            ctk.CTkLabel(inner, text=glyph, font=font(34),
+                         text_color=_pair("faint")).pack(pady=(0, 6))
+        if title:
+            ctk.CTkLabel(inner, text=title, font=font(role="heading"),
+                         text_color=_pair("text")).pack()
+        if caption:
+            ctk.CTkLabel(inner, text=caption, font=font(role="body"),
+                         text_color=_pair("muted"), justify="center",
+                         wraplength=380).pack(pady=(4, 0))
+        if action_text and action:
+            AuraButton(inner, action_text, command=action,
+                       kind="primary").pack(pady=(14, 0))
+
+
+class Dialog(ctk.CTkToplevel):
+    """The house modal dialog (settings, editors, pickers).
+
+    Transient + grab; Escape closes.  Content goes in ``dlg.body`` (padded);
+    buttons in ``dlg.buttons`` (right-aligned; ``add_button`` packs
+    right-to-left, so add the primary FIRST).  Per the layout language,
+    Settings is a Dialog opened with Ctrl+, .
+    """
+
+    def __init__(self, master, title="Dialog", size=(520, 420), resizable=False):
+        super().__init__(master, fg_color=_pair("bg"))
+        self.title(title)
+        self.geometry("%dx%d" % size)
+        if not resizable:
+            self.resizable(False, False)
+        self.transient(master)
+        Heading(self, title).pack(anchor="w", padx=20, pady=(16, 4))
+        self.body = ctk.CTkFrame(self, fg_color="transparent")
+        self.body.pack(fill="both", expand=True, padx=20, pady=(6, 4))
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.pack(fill="x", padx=20, pady=(4, 16))
+        self.buttons = bar
+        self.bind("<Escape>", lambda _e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.after(60, self._center_and_grab)
+
+    def _center_and_grab(self):
+        try:
+            self.update_idletasks()
+            m = self.master
+            x = m.winfo_rootx() + (m.winfo_width() - self.winfo_width()) // 2
+            y = m.winfo_rooty() + (m.winfo_height() - self.winfo_height()) // 3
+            self.geometry("+%d+%d" % (max(0, x), max(0, y)))
+            self.lift()
+            self.focus_force()
+            self.grab_set()
+        except Exception:
+            pass
+
+    def add_button(self, text, command=None, kind="primary"):
+        btn = AuraButton(self.buttons, text=text, kind=kind, height=32,
+                         command=command or self.close)
+        btn.pack(side="right", padx=(8, 0))
+        return btn
+
+    def close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+
 class Tooltip:
     """Raised overlay tooltip after a 500ms hover delay."""
 
@@ -1188,17 +1445,18 @@ class AuraApp(ctk.CTk):
         self.grid_columnconfigure(2, weight=1)
         self.grid_rowconfigure(2, weight=1)
 
-        # ---- sidebar
+        # ---- sidebar (collapsible: toggle_sidebar() / Ctrl+\)
         self.sidebar = ctk.CTkFrame(self, width=g["sidebar_w"], corner_radius=0,
                                     fg_color=_pair("surface"))
         self.sidebar.grid(row=0, column=0, rowspan=4, sticky="nsw")
         self.sidebar.grid_propagate(False)
         self.sidebar.grid_columnconfigure(0, weight=1)
         self.sidebar.grid_rowconfigure(2, weight=1)
+        self._sidebar_visible = True
 
-        hairline = ctk.CTkFrame(self, width=1, corner_radius=0,
-                                fg_color=_pair("border"))
-        hairline.grid(row=0, column=1, rowspan=4, sticky="ns")
+        self._hairline = ctk.CTkFrame(self, width=1, corner_radius=0,
+                                      fg_color=_pair("border"))
+        self._hairline.grid(row=0, column=1, rowspan=4, sticky="ns")
 
         brand = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         brand.grid(row=0, column=0, sticky="ew", padx=16, pady=(18, 14))
@@ -1219,6 +1477,12 @@ class AuraApp(ctk.CTk):
 
         self._nav = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         self._nav.grid(row=1, column=0, sticky="new", padx=10)
+
+        # app-owned sidebar area between the nav pills and the footer —
+        # tag lists, pinned trees, workspace pickers live here.
+        self.sidebar_body = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.sidebar_body.grid(row=2, column=0, sticky="nsew", padx=10,
+                               pady=(10, 0))
 
         foot = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         foot.grid(row=3, column=0, sticky="ew", padx=16, pady=14)
@@ -1271,9 +1535,37 @@ class AuraApp(ctk.CTk):
         style_ttk(self, self.theme)
         windows_polish(self, self.theme)
 
+        # collapsible sidebar — the commercial-app convention (Ctrl+\)
+        try:
+            self.bind_all("<Control-backslash>",
+                          lambda _e: self.toggle_sidebar())
+        except Exception:
+            pass
+
         self._sys_listener = None
         if self._follow_system:
             self._start_system_listener()
+
+    # ---- sidebar collapse ---------------------------------------------
+    @property
+    def sidebar_visible(self):
+        return self._sidebar_visible
+
+    def toggle_sidebar(self, visible=None):
+        """Collapse/restore the sidebar (Ctrl+\\).  ``visible`` forces a state."""
+        want = (not self._sidebar_visible) if visible is None else bool(visible)
+        if want == self._sidebar_visible:
+            return
+        self._sidebar_visible = want
+        try:
+            if want:
+                self.sidebar.grid()
+                self._hairline.grid()
+            else:
+                self.sidebar.grid_remove()
+                self._hairline.grid_remove()
+        except Exception:
+            pass
 
     # ---- sections -----------------------------------------------------
     def add_section(self, sid, label, glyph="", builder=None):
@@ -1372,29 +1664,77 @@ class AuraApp(ctk.CTk):
     def _start_system_listener(self):
         """Re-theme this window when the OS flips Aura Dark/Light.
 
-        ``darkdetect.listener`` blocks on a background daemon thread; the
-        callback marshals the change onto the tk main loop via ``after`` so all
-        widget work stays on the UI thread.  Entirely best-effort — a desktop
-        without a live signal simply follows on next launch instead.
+        On Linux we monitor the GNOME ``color-scheme`` gsettings key ourselves
+        (``gsettings monitor`` on a daemon thread) — it is the signal the Quick
+        OS shell publishes, and vendored darkdetect builds that watch the
+        legacy ``gtk-theme`` key never fire on it (field defect, VM round
+        2026-08-16).  Elsewhere ``darkdetect.listener`` is used.  The callback
+        marshals onto the tk main loop via ``after`` so all widget work stays
+        on the UI thread.  Entirely best-effort — a desktop without a live
+        signal simply follows on next launch instead.
         """
-        if darkdetect is None or not hasattr(darkdetect, "listener"):
-            return
         import threading
 
-        def _cb(value):
+        def _fire(theme):
             try:
-                t = "dark" if str(value).lower().startswith("d") else "light"
-                self.after(0, lambda: self._system_theme_changed(t))
+                self.after(0, lambda: self._system_theme_changed(theme))
             except Exception:
                 pass
 
+        def _gsettings_loop():
+            import subprocess
+            try:
+                proc = subprocess.Popen(
+                    ["gsettings", "monitor",
+                     "org.gnome.desktop.interface", "color-scheme"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    universal_newlines=True)
+            except Exception:
+                return
+            self._sys_proc = proc
+            try:
+                for line in proc.stdout:
+                    v = line.lower()
+                    if "dark" in v:
+                        _fire("dark")
+                    elif "light" in v or "default" in v:
+                        _fire("light")
+            except Exception:
+                pass
+
+        use_gsettings = False
+        if os.name != "nt" and sys.platform != "darwin":
+            try:
+                import shutil
+                use_gsettings = shutil.which("gsettings") is not None
+            except Exception:
+                use_gsettings = False
+
         try:
-            th = threading.Thread(target=darkdetect.listener, args=(_cb,),
-                                  daemon=True)
+            if use_gsettings:
+                th = threading.Thread(target=_gsettings_loop, daemon=True)
+            elif darkdetect is not None and hasattr(darkdetect, "listener"):
+                def _cb(value):
+                    _fire("dark" if str(value).lower().startswith("d")
+                          else "light")
+                th = threading.Thread(target=darkdetect.listener, args=(_cb,),
+                                      daemon=True)
+            else:
+                return
             th.start()
             self._sys_listener = th
         except Exception:
             self._sys_listener = None
+
+    def destroy(self):
+        proc = getattr(self, "_sys_proc", None)
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            self._sys_proc = None
+        return super().destroy()
 
     def _system_theme_changed(self, theme):
         if getattr(self, "_follow_system", False) and theme in ("light", "dark"):

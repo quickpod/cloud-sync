@@ -1,0 +1,4 @@
+{
+  "tagline": "Continuous cloud sync you control — realtime or scheduled, per-file status, conflicted copies, rclone-backed",
+  "description": "Cloud Sync keeps your folders and your cloud in step, Dropbox-style — but with storage you own. Pick a local folder and any S3-compatible remote (AWS S3, Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces, MinIO or a custom endpoint): realtime mode watches for changes and syncs them immediately, or switch to a schedule (every N minutes, or daily at a set time). A live activity feed shows every file's state (synced, syncing, error), conflicts resolve newer-wins with the other version kept as a conflicted copy — data is never silently lost — and one click pauses or resumes everything. One-off transfers, remote browsing and dry-run previews are still there. Backed by the open-source rclone engine; you configure every remote yourself and nothing ever dials home. 100% AI-built and open source."
+}

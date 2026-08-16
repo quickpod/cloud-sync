@@ -22,6 +22,9 @@ jobs:
           --version-file packaging/version.txt
           --hidden-import cloudsync.__main__
           --add-data "cloud-sync.ico;."
+          --add-data "cloud-sync.png;."
+          --add-data "assets;assets"
+          --collect-submodules watchdog
           --collect-all customtkinter
           cloud_sync_app.py
       - name: Stage installer inputs

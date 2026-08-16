@@ -1,3 +1,5 @@
 # Cloud Sync runtime deps — permissive/weak-copyleft only, no AGPL/proprietary.
 customtkinter>=5.2
 darkdetect>=0.8
+# Realtime folder watching for the continuous-sync engine (Apache-2.0).
+watchdog>=3.0

@@ -632,3 +632,64 @@ def sync(source: str, dest: str, *, operation: str = "sync",
                            dry_run=dry_run, extra=extra)
     args += ["--stats-one-line", "--stats", "1s"]
     return _run(args, timeout=24 * 3600)
+
+
+# --------------------------------------------------------------------------- #
+# Per-file operations (the realtime sync engine's building blocks)
+# --------------------------------------------------------------------------- #
+def stat_path(remote_name: str, path: str) -> Optional[Entry]:
+    """Stat ONE remote file/folder via ``rclone lsjson --stat`` (privileged).
+
+    Returns ``None`` when the object does not exist (rclone reports "not
+    found"); raises :class:`CloudSyncError` on real failures.
+    """
+    target = remote_path(remote_name, path)
+    try:
+        out = _run(["lsjson", "--stat", target], timeout=60)
+    except CloudSyncError as exc:
+        msg = str(exc).lower()
+        if "not found" in msg or "directory not found" in msg or \
+                "object not found" in msg or "error 404" in msg:
+            return None
+        raise
+    if not out or not out.strip() or out.strip() == "null":
+        return None
+    try:
+        item = json.loads(out)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(item, dict):
+        return None
+    entries = parse_lsjson(json.dumps([item]))
+    return entries[0] if entries else None
+
+
+def list_recursive(remote_name: str, path: str = "") -> List[Entry]:
+    """Recursively list files under a remote path (``lsjson -R``, files only)."""
+    if not remote_exists(remote_name):
+        raise CloudSyncError(f"No remote named {remote_name!r}.")
+    try:
+        out = _run(["lsjson", "-R", "--files-only",
+                    remote_path(remote_name, path)], timeout=600)
+    except CloudSyncError as exc:
+        if "not found" in str(exc).lower():
+            return []
+        raise
+    return parse_lsjson(out)
+
+
+def copyto(source: str, dest: str) -> None:
+    """Copy ONE file (``rclone copyto``) — local→remote or remote→local."""
+    if not source or not dest:
+        raise CloudSyncError("Both a source and a destination are required.")
+    _run(["copyto", source, dest], timeout=3600)
+
+
+def deletefile(remote_file: str) -> None:
+    """Delete ONE remote file (``rclone deletefile``); missing files are fine."""
+    try:
+        _run(["deletefile", remote_file], timeout=120)
+    except CloudSyncError as exc:
+        if "not found" in str(exc).lower():
+            return
+        raise

@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 r"""Cloud Sync -- an Aura (QuickOpen design system) GUI over ``cloudsync``.
 
-A single Aura window with four sections in the sidebar:
+Layout per branding/aura-design-system/APP-LAYOUT-LANGUAGE.md, benchmarked
+against Dropbox/OneDrive continuous sync.  Sections:
 
+* **Synced folders** (the hero view) -- folder pairs that stay in sync via
+  :mod:`cloudsync.syncengine`: realtime watching by default (scheduled every
+  N minutes / daily at HH:MM as the alternative), a per-pair state column, a
+  live activity feed with per-file ✓/↻/⚠ status, newer-wins conflicts that
+  keep a Dropbox-style conflicted copy, pause/resume, and a live overall
+  status chip in the header.
 * **Remotes** -- a OneDrive-style list of your configured clouds with an
   inline "add / edit remote" form (name, provider, endpoint, region, access
   keys).  You enter everything yourself; the app connects to nothing here.
 * **Browse** -- pick a remote and walk its buckets/folders (user-initiated).
-* **Sync** -- choose a local folder (via the OS-correct pickers), a remote
-  path and a direction, preview with a dry run, then apply.
+* **Transfer** -- one-off: a local folder up, down or both ways, with a
+  dry-run preview.
 * **Status** -- rclone availability/version, the platform, and the config path.
 
 Every operation calls the tested core library (never re-implements the logic)
@@ -42,24 +49,30 @@ import threading
 # that merely importing this module (packaging, headless CI) never fails.
 
 APP_NAME = "Cloud Sync"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 WINDOW_TITLE = "Cloud Sync — by QuickOpen (quickopen.ai)"
 PROJECT_URL = "https://quickopen.ai"
-ACCENT = "#0e9bd6"      # UI-accent registry: cloud-sync -> #0e9bd6
+ACCENT = "#5b86f7"      # Aura brand accent (the old per-app cyan was a
+                        # legacy scaffold accent)
 
 VIEWS = [
+    ("folders", "Synced folders", "⇅"),
     ("remotes", "Remotes", "☁"),
     ("browse", "Browse", "▤"),
-    ("sync", "Sync", "⇅"),
+    ("sync", "Transfer", "→"),
     ("status", "Status", "◉"),
+    ("about", "About", "ℹ"),
 ]
 
 VIEW_DESCRIPTIONS = {
+    "folders": "Folders that stay in sync with your cloud — realtime by "
+               "default, scheduled if you prefer. Newer file wins; the other "
+               "version is kept as a conflicted copy.",
     "remotes": "Configure your S3 / cloud remotes. You supply each endpoint, "
                "bucket and access key — nothing connects on its own.",
     "browse": "Walk a remote's buckets and folders. Runs only when you ask it to.",
-    "sync": "Sync a local folder up, down or both ways. Preview with a dry run "
-            "before applying.",
+    "sync": "One-off transfer: sync a local folder up, down or both ways. "
+            "Preview with a dry run before applying.",
     "status": "rclone availability, your platform, and where the config lives.",
 }
 
@@ -113,10 +126,11 @@ def build_app():
 
     from . import aura, guiconfig, paths
     from .errors import CloudSyncError
-    from . import rclone
+    from . import rclone, syncengine
     from .rclone import (
         PROVIDERS, PROVIDERS_BY_KEY, get_provider, human_size, remote_path,
     )
+    from .syncengine import Pair, SyncEngine, pair_from_dict
 
     PROVIDER_LABELS = [p.label for p in PROVIDERS]
     LABEL_TO_KEY = {p.label: p.key for p in PROVIDERS}
@@ -164,19 +178,25 @@ def build_app():
             self._img_refs_gui = []
             self._edit_name = None          # remote being edited (else None)
             self._browse_history = []       # path breadcrumbs for the Up button
+            self.engine = None              # the continuous-sync engine
+            self._activity = []             # newest-first activity rows
 
             self._set_icon()
             self._build_menu()
 
             self.progress = aura.ProgressBar(self.statusbar.actions,
                                              mode="indeterminate", width=140)
+            # live overall-status chip (header, window-global)
+            self._chip = aura.Caption(self.header_actions, "")
+            self._chip.pack(side="left", padx=(0, 10))
 
             for vid, label, glyph in VIEWS:
                 self.add_section(vid, label, glyph,
                                  getattr(self, "_build_" + vid))
-            self.show("remotes")
+            self.show("folders")
             self.set_status("Ready")
             self.protocol("WM_DELETE_WINDOW", self._on_close)
+            self.after(200, self._start_engine)
 
         # ---- assets / icon
         def _set_icon(self):
@@ -199,12 +219,22 @@ def build_app():
         def _build_menu(self):
             bar = tk.Menu(self)
             filem = tk.Menu(bar, tearoff=0)
+            filem.add_command(label="Add synced folder…", accelerator="Ctrl+N",
+                              command=lambda: (self.show("folders"),
+                                               self._pair_dialog()))
+            filem.add_command(label="Sync now", accelerator="F5",
+                              command=self._sync_now)
+            filem.add_separator()
             filem.add_command(label="Open config folder",
                               command=self._open_config_folder)
+            filem.add_command(label="Settings…", accelerator="Ctrl+,",
+                              command=self._open_settings)
             filem.add_separator()
             filem.add_command(label="Exit", command=self._on_close)
             bar.add_cascade(label="File", menu=filem)
             viewm = tk.Menu(bar, tearoff=0)
+            viewm.add_command(label="Toggle sidebar", accelerator="Ctrl+\\",
+                              command=self.toggle_sidebar)
             viewm.add_command(
                 label="Toggle dark mode",
                 command=lambda: self.set_theme(
@@ -212,17 +242,18 @@ def build_app():
             bar.add_cascade(label="View", menu=viewm)
             helpm = tk.Menu(bar, tearoff=0)
             helpm.add_command(label="About",
-                              command=lambda: messagebox.showinfo(
-                                  "About " + APP_NAME,
-                                  f"{APP_NAME} {APP_VERSION}\n\n"
-                                  "Offline-first S3 / cloud file sync, backed by "
-                                  "rclone.\nYou configure every remote; nothing "
-                                  "dials home.\n\nBuilt by QuickOpen — quickopen.ai"))
+                              command=lambda: self.show("about"))
             bar.add_cascade(label="Help", menu=helpm)
             try:
                 self.config(menu=bar)
             except Exception:
                 pass
+            self.bind_all("<Control-n>",
+                          lambda e: (self.show("folders"),
+                                     self._pair_dialog(), "break")[2])
+            self.bind_all("<F5>", lambda e: self._sync_now())
+            self.bind_all("<Control-comma>",
+                          lambda e: (self._open_settings(), "break")[1])
 
         def _open_config_folder(self):
             paths.ensure_config_dir()
@@ -233,7 +264,9 @@ def build_app():
             super().show(sid)
             self.set_status("Ready")
             try:
-                if sid == "remotes":
+                if sid == "folders":
+                    self._folders_refresh()
+                elif sid == "remotes":
                     self._remotes_refresh()
                 elif sid == "browse":
                     self._browse_refresh_remotes()
@@ -243,6 +276,531 @@ def build_app():
                     self._status_refresh()
             except Exception:
                 pass
+
+        # ===============================================================
+        # The continuous-sync engine (realtime / scheduled)
+        # ===============================================================
+        def _config_pairs(self):
+            out = []
+            for d in guiconfig.get_pairs():
+                p = pair_from_dict(d)
+                if p is not None:
+                    out.append(p)
+            return out
+
+        def _start_engine(self):
+            """(Re)start the engine from the persisted pairs + mode."""
+            self._stop_engine()
+            pairs = self._config_pairs()
+            self.engine = SyncEngine(pairs, notify=self._engine_notify)
+            mode = guiconfig.get_sync_mode()
+            daily = guiconfig.get_daily_at()
+            if pairs and rclone.rclone_available():
+                self.engine.start(
+                    syncengine.REALTIME if mode == "realtime"
+                    else syncengine.SCHEDULED,
+                    interval_minutes=guiconfig.get_interval_minutes(),
+                    daily_at=daily or None)
+                if guiconfig.get_paused():
+                    self.engine.pause()
+            self._update_chip()
+            self._update_pause_btn()
+
+        def _stop_engine(self):
+            if self.engine is not None:
+                try:
+                    self.engine.stop()
+                except Exception:
+                    pass
+                self.engine = None
+
+        def _engine_notify(self, event):
+            """Engine thread → UI thread."""
+            try:
+                self.after(0, lambda: self._engine_event(event))
+            except Exception:
+                pass
+
+        def _engine_event(self, event):
+            if event.get("kind") == "file":
+                pair, rel = event["pair"], event["rel"]
+                status, detail = event["status"], event.get("detail", "")
+                self._activity = [
+                    a for a in self._activity
+                    if not (a[0] == pair.key and a[1] == rel)]
+                import time as _t
+                self._activity.insert(0, (pair.key, rel, status, detail,
+                                          pair, _t.time()))
+                del self._activity[120:]
+                self._render_activity()
+            self._update_chip(event if event.get("kind") == "overall" else None)
+            self._folders_refresh_status()
+
+        def _update_chip(self, overall=None):
+            eng = self.engine
+            if eng is None or not self._config_pairs():
+                text, color = "", None
+            elif overall is not None:
+                s = overall.get("status")
+                if s == "paused":
+                    text, color = "⏸  Paused", "muted"
+                elif s == "syncing":
+                    text, color = f"↻  Syncing ({overall.get('pending', 0)})", "accent"
+                elif s == "error":
+                    text, color = f"⚠  {overall.get('errors', 0)} error(s)", "danger"
+                else:
+                    text, color = "●  All synced", "ok"
+            elif eng.paused:
+                text, color = "⏸  Paused", "muted"
+            else:
+                text, color = "●  Watching" if eng.mode == syncengine.REALTIME \
+                    else "◷  Scheduled", "ok"
+            try:
+                self._chip.configure(
+                    text=text,
+                    text_color=aura.P(color) if color else aura.P("muted"))
+            except Exception:
+                pass
+
+        def _sync_now(self):
+            if self.engine is None or not self._config_pairs():
+                self.set_error("Add a synced folder first.")
+                return
+            if not rclone.rclone_available():
+                self.set_error(rclone.NO_RCLONE_MSG)
+                return
+            if self.engine.mode is None:
+                self._start_engine()
+            self.engine.sync_now()
+            self.set_status("Sync requested.", kind="working")
+
+        def _toggle_pause(self):
+            if self.engine is None:
+                return
+            if self.engine.paused:
+                self.engine.resume()
+                guiconfig.set_paused(False)
+            else:
+                self.engine.pause()
+                guiconfig.set_paused(True)
+            self._update_pause_btn()
+            self._update_chip()
+
+        def _update_pause_btn(self):
+            try:
+                paused = self.engine is not None and self.engine.paused
+                self._pause_btn.configure(
+                    text="▶ Resume" if paused else "⏸ Pause")
+            except Exception:
+                pass
+
+        # ===============================================================
+        # Synced folders section (the Dropbox-style hero view)
+        # ===============================================================
+        def _build_folders(self, frame):
+            frame.grid_columnconfigure(0, weight=1)
+            frame.grid_rowconfigure(1, weight=1)
+            frame.grid_rowconfigure(3, weight=2)
+
+            tb = aura.Toolbar(frame)
+            tb.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+            tb.add_button("＋ Add folder", self._pair_dialog, kind="primary")
+            self._pause_btn = tb.add_button("⏸ Pause", self._toggle_pause)
+            tb.add_button("⟳ Sync now", self._sync_now, kind="ghost",
+                          tooltip="Reconcile every synced folder now (F5)")
+            self._mode_cap = aura.Caption(tb, "")
+            tb.add_right(self._mode_cap)
+
+            pwrap = ctk.CTkFrame(frame, fg_color=aura._pair("surface"),
+                                 corner_radius=10, border_width=1,
+                                 border_color=aura._pair("border"))
+            pwrap.grid(row=1, column=0, sticky="nsew")
+            self._pairs_wrap = pwrap
+            cols = ("local", "remote", "state")
+            self._pairs_tree = ttk.Treeview(pwrap, columns=cols,
+                                            show="headings",
+                                            selectmode="browse", height=4)
+            self._pairs_tree.heading("local", text="Local folder", anchor="w")
+            self._pairs_tree.heading("remote", text="Remote", anchor="w")
+            self._pairs_tree.heading("state", text="State", anchor="w")
+            self._pairs_tree.column("local", width=320, stretch=True)
+            self._pairs_tree.column("remote", width=260, stretch=True)
+            self._pairs_tree.column("state", width=130, stretch=False)
+            psb = aura.AuraScrollbar(pwrap, command=self._pairs_tree.yview)
+            self._pairs_tree.configure(yscrollcommand=psb.set)
+            psb.pack(side="right", fill="y", padx=(0, 4), pady=6)
+            self._pairs_tree.pack(side="left", fill="both", expand=True,
+                                  padx=(6, 0), pady=6)
+            self._pairs_tree.bind("<Button-3>", self._show_pair_menu)
+            self._pairs_tree.bind("<Delete>", lambda e: self._remove_pair())
+            self._pair_menu = tk.Menu(self, tearoff=0)
+            aura.track(self._pair_menu, "menu")
+
+            self._act_label = aura.SectionLabel(frame, "Activity")
+            self._act_label.grid(row=2, column=0, sticky="w", pady=(12, 4))
+            awrap = ctk.CTkFrame(frame, fg_color=aura._pair("surface"),
+                                 corner_radius=10, border_width=1,
+                                 border_color=aura._pair("border"))
+            awrap.grid(row=3, column=0, sticky="nsew")
+            self._act_wrap = awrap
+            cols = ("st", "file", "detail", "when")
+            self._act_tree = ttk.Treeview(awrap, columns=cols,
+                                          show="headings",
+                                          selectmode="browse")
+            self._act_tree.heading("st", text="")
+            self._act_tree.heading("file", text="File", anchor="w")
+            self._act_tree.heading("detail", text="Detail", anchor="w")
+            self._act_tree.heading("when", text="When", anchor="e")
+            self._act_tree.column("st", width=36, minwidth=32,
+                                  anchor="center", stretch=False)
+            self._act_tree.column("file", width=320, stretch=True)
+            self._act_tree.column("detail", width=260, stretch=True)
+            self._act_tree.column("when", width=76, minwidth=64, anchor="e",
+                                  stretch=False)
+            asb = aura.AuraScrollbar(awrap, command=self._act_tree.yview)
+            self._act_tree.configure(yscrollcommand=asb.set)
+            asb.pack(side="right", fill="y", padx=(0, 4), pady=6)
+            self._act_tree.pack(side="left", fill="both", expand=True,
+                                padx=(6, 0), pady=6)
+            self._style_activity_tags()
+
+            self.empty_pairs = aura.EmptyState(
+                frame, title="Nothing syncing yet",
+                caption="Pick a local folder and a remote — Cloud Sync keeps "
+                        "them in step in realtime (or on your schedule), and "
+                        "conflicts always keep both versions.",
+                action_text="＋ Add synced folder", action=self._pair_dialog,
+                image=(asset_path("assets/sync-empty-light.png"),
+                       asset_path("assets/sync-empty-dark.png")))
+            self._folders_refresh()
+
+        def _style_activity_tags(self):
+            try:
+                self._act_tree.tag_configure(
+                    "error", foreground=aura.P("danger"))
+                self._act_tree.tag_configure(
+                    "conflict", foreground=aura.P("warn"))
+            except Exception:
+                pass
+
+        def _folders_refresh(self):
+            if not hasattr(self, "_pairs_tree"):
+                return
+            pairs = self._config_pairs()
+            self._pairs_tree.delete(*self._pairs_tree.get_children())
+            for p in pairs:
+                self._pairs_tree.insert(
+                    "", "end", iid=p.key,
+                    values=(p.local,
+                            rclone.remote_path(p.remote, p.rpath), ""))
+            if pairs:
+                self.empty_pairs.place_forget()
+                self._pairs_wrap.grid()
+                self._act_label.grid()
+                self._act_wrap.grid()
+            else:
+                self._pairs_wrap.grid_remove()
+                self._act_label.grid_remove()
+                self._act_wrap.grid_remove()
+                self.empty_pairs.place(relx=0, rely=0.06, relwidth=1,
+                                       relheight=0.9)
+                self.empty_pairs.lift()
+            self._folders_refresh_status()
+            self._render_activity()
+            mode = guiconfig.get_sync_mode()
+            if mode == "realtime":
+                self._mode_cap.configure(text="Realtime — watching for changes")
+            else:
+                daily = guiconfig.get_daily_at()
+                self._mode_cap.configure(
+                    text=("Scheduled daily at " + daily) if daily else
+                    f"Scheduled every {guiconfig.get_interval_minutes()} min")
+
+        def _folders_refresh_status(self):
+            """Update the per-pair State column from the engine's file map."""
+            if not hasattr(self, "_pairs_tree") or self.engine is None:
+                return
+            for p in self._config_pairs():
+                if not self._pairs_tree.exists(p.key):
+                    continue
+                states = [s for (pk, _rel), (s, _d, _t)
+                          in self.engine.file_status.items() if pk == p.key]
+                if any(s == syncengine.ERROR for s in states):
+                    txt = "⚠ attention"
+                elif any(s in (syncengine.SYNCING, syncengine.PENDING)
+                         for s in states):
+                    txt = "↻ syncing"
+                elif self.engine.paused:
+                    txt = "⏸ paused"
+                else:
+                    txt = "✓ up to date"
+                try:
+                    self._pairs_tree.set(p.key, "state", txt)
+                except Exception:
+                    pass
+
+        def _render_activity(self):
+            if not hasattr(self, "_act_tree"):
+                return
+            import time as _t
+            tree = self._act_tree
+            tree.delete(*tree.get_children())
+            now = _t.time()
+            for pkey, rel, status, detail, pair, ts in self._activity[:80]:
+                glyph = syncengine.STATE_GLYPH.get(status, "")
+                age = now - ts
+                when = "now" if age < 90 else (
+                    "%dm" % (age // 60) if age < 3600 else "%dh" % (age // 3600))
+                tags = ("error",) if status == syncengine.ERROR else (
+                    ("conflict",) if status == syncengine.CONFLICT else ())
+                tree.insert("", "end",
+                            values=(glyph, rel, detail, when), tags=tags)
+
+        def _show_pair_menu(self, event):
+            iid = self._pairs_tree.identify_row(event.y)
+            if not iid:
+                return
+            self._pairs_tree.selection_set(iid)
+            m = self._pair_menu
+            m.delete(0, "end")
+            m.add_command(label="Sync now", command=self._sync_now)
+            m.add_command(label="Open local folder",
+                          command=self._open_pair_folder)
+            m.add_separator()
+            m.add_command(label="Remove…  (Del)", command=self._remove_pair)
+            aura.style_menu(m)
+            try:
+                m.tk_popup(event.x_root, event.y_root)
+            finally:
+                try:
+                    m.grab_release()
+                except Exception:
+                    pass
+
+        def _selected_pair(self):
+            sel = self._pairs_tree.selection()
+            if not sel:
+                return None
+            for p in self._config_pairs():
+                if p.key == sel[0]:
+                    return p
+            return None
+
+        def _open_pair_folder(self):
+            p = self._selected_pair()
+            if p:
+                open_in_file_manager(p.local)
+
+        def _remove_pair(self):
+            p = self._selected_pair()
+            if p is None:
+                self.set_error("Select a synced folder to remove.")
+                return
+            if not messagebox.askyesno(
+                    "Stop syncing",
+                    f"Stop keeping\n  {p.local}\nin sync with\n  "
+                    f"{rclone.remote_path(p.remote, p.rpath)}?\n\n"
+                    "No files are deleted anywhere."):
+                return
+            guiconfig.remove_pair(p.local, p.remote, p.rpath)
+            self._start_engine()
+            self._folders_refresh()
+            self.set_success("Stopped syncing that folder.")
+
+        def _pair_dialog(self):
+            names = self._all_remote_names()
+            if not names:
+                self.set_error("Add a remote first (Remotes tab).")
+                self.show("remotes")
+                return
+            dlg = aura.Dialog(self, title="Add synced folder",
+                              size=(520, 330))
+            aura.Caption(dlg.body, "Local folder:").pack(anchor="w")
+            row = ctk.CTkFrame(dlg.body, fg_color="transparent")
+            row.pack(fill="x", pady=(4, 10))
+            local_e = aura.AuraEntry(row, placeholder="Choose a folder…")
+            local_e.pack(side="left", fill="x", expand=True)
+
+            def browse():
+                chosen = filedialog.askdirectory(
+                    initialdir=str(paths.default_local_dir()), parent=dlg)
+                if chosen:
+                    local_e.delete(0, "end")
+                    local_e.insert(0, chosen)
+            aura.AuraButton(row, "Browse…", kind="secondary", height=30,
+                            command=browse).pack(side="left", padx=(8, 0))
+
+            aura.Caption(dlg.body, "Remote:").pack(anchor="w")
+            remote_o = aura.AuraOption(dlg.body, values=names, width=220)
+            remote_o.set(names[0])
+            remote_o.pack(anchor="w", pady=(4, 10))
+            aura.Caption(dlg.body, "Remote path (bucket/folder):").pack(
+                anchor="w")
+            rpath_e = aura.AuraEntry(dlg.body,
+                                     placeholder="bucket/folder …")
+            rpath_e.pack(fill="x", pady=(4, 0))
+
+            def ok(_e=None):
+                local = paths.normalize_local(local_e.get().strip())
+                rp = rpath_e.get().strip()
+                if not local or not os.path.isdir(local):
+                    self.set_error("Choose an existing local folder.")
+                    return
+                dlg.close()
+                guiconfig.add_pair(local, remote_o.get(), rp)
+                guiconfig.add_recent(local)
+                self._start_engine()
+                self._folders_refresh()
+                self.set_success("Folder added — first sync starting.")
+
+            dlg.add_button("Start syncing", ok)
+            dlg.add_button("Cancel", dlg.close, kind="secondary")
+            self.after(120, local_e.focus_set)
+
+        # ---- settings (Ctrl+,)
+        def _open_settings(self):
+            dlg = aura.Dialog(self, title="Settings", size=(560, 470))
+
+            aura.SectionLabel(dlg.body, "Sync mode").pack(anchor="w",
+                                                          pady=(0, 2))
+            mrow = ctk.CTkFrame(dlg.body, fg_color="transparent")
+            mrow.pack(anchor="w", pady=(4, 6))
+            mode_seg = aura.SegmentedControl(
+                mrow, values=["Realtime", "Scheduled"], width=220,
+                command=lambda v: apply_mode(v))
+            mode_seg.set("Realtime" if guiconfig.get_sync_mode() == "realtime"
+                         else "Scheduled")
+            mode_seg.pack(side="left")
+            aura.Caption(dlg.body,
+                         "Realtime watches your folders and syncs changes "
+                         "immediately (Dropbox-style).").pack(anchor="w")
+
+            srow = ctk.CTkFrame(dlg.body, fg_color="transparent")
+            srow.pack(anchor="w", pady=(8, 2))
+            aura.Caption(srow, "Scheduled:").pack(side="left", padx=(0, 8))
+            ivals = ["Every 15 min", "Every 30 min", "Every hour",
+                     "Every 4 hours", "Daily at…"]
+            daily = guiconfig.get_daily_at()
+            iv = guiconfig.get_interval_minutes()
+            cur = "Daily at…" if daily else {15: "Every 15 min",
+                                             30: "Every 30 min",
+                                             60: "Every hour",
+                                             240: "Every 4 hours"}.get(
+                iv, "Every 30 min")
+            int_o = aura.AuraOption(srow, values=ivals, width=140, height=30,
+                                    command=lambda v: apply_sched(v))
+            int_o.set(cur)
+            int_o.pack(side="left")
+            daily_e = aura.AuraEntry(srow, placeholder="HH:MM", width=70,
+                                     height=30)
+            if daily:
+                daily_e.insert(0, daily)
+            daily_e.pack(side="left", padx=(8, 0))
+
+            def apply_mode(v):
+                guiconfig.set_sync_mode(
+                    "realtime" if v == "Realtime" else "scheduled")
+                self._start_engine()
+                self._folders_refresh()
+
+            def apply_sched(v):
+                mins = {"Every 15 min": 15, "Every 30 min": 30,
+                        "Every hour": 60, "Every 4 hours": 240}.get(v)
+                if mins:
+                    guiconfig.set_daily_at("")
+                    guiconfig.set_interval_minutes(mins)
+                    self._start_engine()
+                    self._folders_refresh()
+
+            def apply_daily(_e=None):
+                t = daily_e.get().strip()
+                if t and syncengine.parse_daily_time(t):
+                    guiconfig.set_daily_at(t)
+                    int_o.set("Daily at…")
+                    self._start_engine()
+                    self._folders_refresh()
+                elif t:
+                    self.set_error("Daily time must be HH:MM (e.g. 21:30).")
+            daily_e.bind("<Return>", apply_daily)
+            daily_e.bind("<FocusOut>", apply_daily)
+
+            aura.SectionLabel(dlg.body, "Appearance").pack(anchor="w",
+                                                           pady=(14, 2))
+            trow = ctk.CTkFrame(dlg.body, fg_color="transparent")
+            trow.pack(anchor="w", pady=(4, 2))
+            aura.Caption(trow, "Theme").pack(side="left", padx=(0, 10))
+            cur_t = guiconfig.get_theme()
+            th = aura.AuraOption(trow, values=["System", "Light", "Dark"],
+                                 width=110, height=30,
+                                 command=self._set_theme_pref)
+            th.set(cur_t.capitalize() if cur_t in ("light", "dark")
+                   else "System")
+            th.pack(side="left")
+            aura.Caption(dlg.body,
+                         "System follows the OS Aura Dark/Light live.").pack(
+                anchor="w")
+
+            aura.SectionLabel(dlg.body, "Data").pack(anchor="w", pady=(14, 2))
+            aura.Caption(dlg.body, str(paths.config_dir())).pack(anchor="w")
+
+            dlg.add_button("Close")
+
+        def _set_theme_pref(self, choice):
+            pref = str(choice).lower()
+            if pref == "system":
+                guiconfig.set_theme("system")
+                self._follow_system = True
+                if self._sys_listener is None:
+                    self._start_system_listener()
+                self.set_theme(aura._system_theme(), _system=True)
+            elif pref in ("light", "dark"):
+                self.set_theme(pref)     # persists via on_theme_change
+
+        # ---- theme: keep tracked tags + chip in sync
+        def set_theme(self, theme, _system=False):
+            super().set_theme(theme, _system=_system)
+            try:
+                self._style_activity_tags()
+                self._update_chip()
+            except Exception:
+                pass
+
+        # ===============================================================
+        # About section
+        # ===============================================================
+        def _build_about(self, frame):
+            card = aura.Card(frame, title="About Cloud Sync")
+            card.pack(fill="x")
+            aura.Heading(card.body, APP_NAME).pack(anchor="w")
+            aura.Caption(card.body, f"Version {APP_VERSION}").pack(
+                anchor="w", pady=(0, 10))
+            ctk.CTkLabel(
+                card.body, font=aura.font(), justify="left", anchor="w",
+                wraplength=560,
+                text="Offline-first S3 / cloud file sync, backed by rclone. "
+                     "Keep folders continuously in sync (realtime or "
+                     "scheduled) with per-file status and Dropbox-style "
+                     "conflicted copies — data is never silently lost.\n\n"
+                     "You configure every remote yourself; nothing dials "
+                     "home. 100% AI-built, open source, published on "
+                     "QuickOpen.").pack(anchor="w")
+            aura.Caption(card.body,
+                         "Shortcuts: Ctrl+N add synced folder · F5 sync now "
+                         "· Ctrl+, settings · Ctrl+\\ sidebar").pack(
+                anchor="w", pady=(10, 0))
+            aura.Caption(card.body,
+                         "Licensed under Apache-2.0. Built on rclone (MIT), "
+                         "watchdog (Apache-2.0) and CustomTkinter (MIT)."
+                         ).pack(anchor="w", pady=(10, 4))
+            def _open_site():
+                try:
+                    import webbrowser
+                    webbrowser.open(PROJECT_URL)
+                except Exception:
+                    pass
+            aura.AuraButton(card.body, "Project page: quickopen.ai",
+                            kind="ghost", command=_open_site).pack(
+                anchor="w", pady=(6, 0))
 
         # ---- background operation runner
         def _bg(self, work, on_ok, button=None, busy="Working…"):
@@ -794,6 +1352,7 @@ def build_app():
 
         # ---- lifecycle
         def _on_close(self):
+            self._stop_engine()
             try:
                 self.destroy()
             except Exception:

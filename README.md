@@ -27,6 +27,15 @@ signed installer targets Windows.
 
 ## Features
 
+- **Synced folders (Dropbox-style continuous sync)** — pick a local folder and
+  a remote: **realtime mode** (the default) watches for changes and syncs them
+  immediately (via `watchdog`, with a polling fallback), or switch to a
+  **schedule** (every N minutes, or daily at HH:MM). A live activity feed shows
+  per-file state (✓ synced / ↻ syncing / ⚠ error), an overall status chip
+  lives in the header, and one click pauses/resumes everything.
+- **Conflicts never lose data** — newer file wins the canonical name; the
+  other version is kept as a Dropbox-style `name (conflicted copy YYYY-MM-DD)`
+  file, locally and in the cloud.
 - **Remotes (OneDrive-style)** — add a cloud in a simple form: pick a provider,
   paste your **endpoint, access key ID and secret**, and save. Supported out of
   the box: **Amazon S3, Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean
