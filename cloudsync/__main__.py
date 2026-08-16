@@ -33,7 +33,7 @@ from . import (
     sync,
     test_remote,
 )
-from .rclone import NO_RCLONE_MSG, get_provider
+from .rclone import NO_RCLONE_MSG, get_provider, sanitize_endpoint
 
 
 # --- helpers ----------------------------------------------------------------
@@ -80,17 +80,24 @@ def cmd_remotes(a):
     print(f"{'NAME':<20} {'PROVIDER':<22} {'REGION':<12} ENDPOINT")
     print("-" * 78)
     for r in remotes:
+        ep = r.endpoint or "—"
+        if r.bucket:
+            ep += f"  (bucket: {r.bucket})"
         print(f"{r.name:<20} {r.provider_label():<22} "
-              f"{(r.region or '—'):<12} {r.endpoint or '—'}")
+              f"{(r.region or '—'):<12} {ep}")
     print(f"\n{len(remotes)} remote(s). Config: {paths.default_config_path()}")
 
 
 def cmd_add(a):
     prov = get_provider(a.provider)  # validates early with a clear message
     secret = _resolve_secret(a)
+    clean_ep, stripped = sanitize_endpoint(a.endpoint or "")
+    if stripped:
+        print(f"note: removed '/{stripped}' from the endpoint (kept "
+              f"{clean_ep}) — bucket names go in --bucket, not the endpoint.")
     remote = add_remote(a.name, prov.key, a.access_key, secret,
                         endpoint=a.endpoint, region=a.region,
-                        overwrite=a.force)
+                        bucket=a.bucket, overwrite=a.force)
     where = "obscured and saved" if rclone_available() else "saved (rclone not installed)"
     print(f"Remote {remote.name!r} ({remote.provider_label()}) {where}.")
     if not rclone_available():
@@ -110,12 +117,18 @@ def cmd_test(a):
 
 
 def cmd_ls(a):
-    entries = list_path(a.name, a.path)
+    path = a.path
+    if not path:
+        # A remote with a configured bucket lists from that bucket, never the
+        # account root (bucket-scoped credentials cannot list the root).
+        from .rclone import get_remote
+        path = get_remote(a.name).bucket
+    entries = list_path(a.name, path)
     if a.json:
         print(json.dumps([e.as_dict() for e in entries], indent=2))
         return
     if not entries:
-        print(f"(empty) {remote_path(a.name, a.path)}")
+        print(f"(empty) {remote_path(a.name, path)}")
         return
     for e in entries:
         kind = "d" if e.is_dir else "-"
@@ -214,8 +227,14 @@ def build_parser():
     s.add_argument("--secret", metavar="KEY",
                    help="secret access key (else $CLOUDSYNC_SECRET or a prompt)")
     s.add_argument("--endpoint", metavar="URL",
-                   help="endpoint URL (required for non-AWS providers)")
+                   help="endpoint URL (required for non-AWS providers); "
+                        "host only — any path is stripped")
     s.add_argument("--region", metavar="R", help="region (optional)")
+    s.add_argument("--bucket", metavar="B",
+                   help="bucket name — required if your credentials are "
+                        "scoped to one bucket (e.g. a Cloudflare R2 API "
+                        "token limited to a single bucket); test/ls then "
+                        "start inside it")
     s.add_argument("-f", "--force", action="store_true",
                    help="overwrite an existing remote of the same name")
 

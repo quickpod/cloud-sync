@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Cloud Sync
+GenericName=Cloud Folder Sync
+Comment=Keep folders in sync with S3-compatible clouds — realtime or scheduled, rclone-backed
+Exec=/opt/quickopen/cloud-sync/CloudSync
+Icon=quickopen-cloud-sync
+Terminal=false
+Categories=Utility;FileTools;Network;
+Keywords=sync;backup;s3;r2;rclone;cloud;bucket;
+StartupNotify=true

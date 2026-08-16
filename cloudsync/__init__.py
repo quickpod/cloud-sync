@@ -29,6 +29,7 @@ from __future__ import annotations
 from .errors import CloudSyncError
 from . import paths
 from .rclone import (
+    BUCKET_KEY,
     OPERATIONS,
     PROVIDERS,
     PROVIDERS_BY_KEY,
@@ -40,6 +41,7 @@ from .rclone import (
     build_remote_section,
     build_sync_args,
     delete_remote,
+    friendly_test_error,
     get_provider,
     get_remote,
     human_size,
@@ -56,17 +58,19 @@ from .rclone import (
     remote_names,
     remote_path,
     render_config,
+    sanitize_endpoint,
     save_remotes,
     sync,
     test_remote,
     validate_remote_name,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
     "CloudSyncError",
     "paths",
+    "BUCKET_KEY",
     "OPERATIONS",
     "PROVIDERS",
     "PROVIDERS_BY_KEY",
@@ -77,6 +81,8 @@ __all__ = [
     "get_provider",
     "validate_remote_name",
     "build_remote_section",
+    "sanitize_endpoint",
+    "friendly_test_error",
     "parse_config",
     "render_config",
     "list_remotes",

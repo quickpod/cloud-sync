@@ -42,6 +42,24 @@ signed installer targets Windows.
   Spaces, MinIO / self-hosted, and any other S3-compatible endpoint.** Secrets
   are stored obscured (via rclone) in a dedicated, `0600` config file — never in
   your global rclone config.
+- **Bucket-scoped credentials just work** — if your key only has access to one
+  bucket (a Cloudflare R2 API token limited to a single bucket, or an S3 IAM
+  policy scoped to one bucket), enter that bucket in the remote's **Bucket**
+  field. Test, Browse and syncs then start *inside* the bucket instead of the
+  account root — which scoped credentials cannot list. The bucket is stored
+  app-side (`cloudsync_bucket` in the remote's section; rclone ignores keys it
+  doesn't know, verified).
+- **Endpoints are kept clean** — S3 endpoints must be scheme + host only; a
+  path on the end (usually a bucket name pasted into the URL) breaks SigV4
+  request signing and every call then fails with `SignatureDoesNotMatch`.
+  Cloud Sync strips any path on save and tells you it did. Connection-test
+  failures are mapped to actionable messages: `SignatureDoesNotMatch` points
+  at the secret key (for R2: the SHA-256-derived S3 secret shown at token
+  creation, **not** the token value) and the endpoint; access-denied on the
+  account root points at the Bucket field.
+- **In-app Help** — a Help tab (F1) walks through adding each cloud, the
+  Cloudflare R2 specifics (bare account endpoint, the S3 key pair shown at
+  token creation, scoped tokens), and what the common errors actually mean.
 - **Browse** — walk a remote's buckets and folders, with sizes. Runs only when
   you ask it to.
 - **Sync** — choose a local folder, a remote path and a direction (**Upload ↑**,
@@ -72,6 +90,9 @@ python -m cloudsync add work-s3 --provider aws \
     --access-key AKIA... --region eu-west-1        # secret via prompt or $CLOUDSYNC_SECRET
 python -m cloudsync add lab --provider minio \
     --access-key AK --endpoint https://minio.example.com
+python -m cloudsync add media --provider r2 \
+    --access-key AK --endpoint https://<account-id>.r2.cloudflarestorage.com \
+    --bucket media-bucket                          # R2 token scoped to one bucket
 python -m cloudsync remotes                        # list configured remotes (secrets redacted)
 
 python -m cloudsync test work-s3                   # connectivity check (network)
@@ -88,6 +109,23 @@ python -m cloudsync status                         # rclone + platform + config 
 
 Most commands accept `--json`, and every command exits non-zero with a clean
 `error:` message (never a traceback) on failure.
+
+## Cloudflare R2 notes
+
+- **Endpoint**: the bare account endpoint,
+  `https://<account-id>.r2.cloudflarestorage.com` — nothing after the host.
+  A bucket name pasted into the URL breaks request signing
+  (`SignatureDoesNotMatch`); Cloud Sync strips it on save and says so.
+- **Keys**: when you create an R2 API token, Cloudflare also displays an S3
+  **Access Key ID / Secret Access Key** pair — use those. The secret is the
+  SHA-256 hash of the token value and is shown **only at token creation**; it
+  is not the token value itself. Lost it? Create a new token and copy the S3
+  pair this time.
+- **Scoped tokens**: a token limited to one bucket cannot `ListBuckets`, so a
+  root-level connection test 403s even though the token is fine. Put the
+  bucket's name in the **Bucket** field (`--bucket` on the CLI) and Cloud Sync
+  tests/browses inside it instead.
+- **Region**: `auto`.
 
 ## Requirements
 

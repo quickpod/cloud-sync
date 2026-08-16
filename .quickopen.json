@@ -1,10 +1,10 @@
 {
   "slug": "cloud-sync",
   "name": "Cloud Sync",
-  "tagline": "Configure S3 & major-cloud remotes and sync folders both ways — rclone-backed, offline-first, nothing dials home.",
+  "tagline": "Continuous cloud sync you control \u2014 realtime or scheduled, per-file status, conflicted copies, rclone-backed",
   "categorySlug": "backup-sync",
   "license": "Apache-2.0",
-  "description": "A friendly, OneDrive-style config front-end for S3 and every major S3-compatible cloud (AWS S3, Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces, MinIO and any custom endpoint). You enter each remote's endpoint, bucket and access keys yourself; the app connects to nothing on its own. Browse buckets, preview changes with a dry run, and sync a local folder up, down or both ways. Backed by rclone when installed, and it degrades gracefully with clear guidance when it is not. Runs locally, no telemetry, no dial-home.",
+  "description": "Cloud Sync keeps your folders and your cloud in step, Dropbox-style \u2014 but with storage you own. Pick a local folder and any S3-compatible remote (AWS S3, Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces, MinIO or a custom endpoint): realtime mode watches for changes and syncs them immediately, or switch to a schedule (every N minutes, or daily at a set time). A live activity feed shows every file's state (synced, syncing, error), conflicts resolve newer-wins with the other version kept as a conflicted copy \u2014 data is never silently lost \u2014 and one click pauses or resumes everything. One-off transfers, remote browsing and dry-run previews are still there. Bucket-scoped credentials (like single-bucket Cloudflare R2 API tokens) are first-class: set the remote's Bucket field and testing, browsing and syncing start inside that bucket, with clear guidance instead of raw S3 errors \u2014 plus an in-app Help tab covering each provider's setup. Backed by the open-source rclone engine; you configure every remote yourself and nothing ever dials home. 100% AI-built and open source.",
   "aiStack": "Python (tkinter + CLI), rclone",
   "platforms": [
     "windows",

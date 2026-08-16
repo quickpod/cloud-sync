@@ -49,7 +49,7 @@ import threading
 # that merely importing this module (packaging, headless CI) never fails.
 
 APP_NAME = "Cloud Sync"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 WINDOW_TITLE = "Cloud Sync — by QuickOpen (quickopen.ai)"
 PROJECT_URL = "https://quickopen.ai"
 ACCENT = "#5b86f7"      # Aura brand accent (the old per-app cyan was a
@@ -61,6 +61,7 @@ VIEWS = [
     ("browse", "Browse", "▤"),
     ("sync", "Transfer", "→"),
     ("status", "Status", "◉"),
+    ("help", "Help", "?"),
     ("about", "About", "ℹ"),
 ]
 
@@ -74,6 +75,8 @@ VIEW_DESCRIPTIONS = {
     "sync": "One-off transfer: sync a local folder up, down or both ways. "
             "Preview with a dry run before applying.",
     "status": "rclone availability, your platform, and where the config lives.",
+    "help": "How to connect each cloud, what the Bucket field is for, and "
+            "what the common errors mean.",
 }
 
 
@@ -241,9 +244,12 @@ def build_app():
                     "light" if self.theme == "dark" else "dark"))
             bar.add_cascade(label="View", menu=viewm)
             helpm = tk.Menu(bar, tearoff=0)
+            helpm.add_command(label="Help topics", accelerator="F1",
+                              command=lambda: self.show("help"))
             helpm.add_command(label="About",
                               command=lambda: self.show("about"))
             bar.add_cascade(label="Help", menu=helpm)
+            self.bind_all("<F1>", lambda e: self.show("help"))
             try:
                 self.config(menu=bar)
             except Exception:
@@ -631,7 +637,16 @@ def build_app():
                             command=browse).pack(side="left", padx=(8, 0))
 
             aura.Caption(dlg.body, "Remote:").pack(anchor="w")
-            remote_o = aura.AuraOption(dlg.body, values=names, width=220)
+
+            def remote_picked(name=None):
+                # a remote with a configured bucket starts inside that bucket
+                bucket = self._bucket_of(name or remote_o.get())
+                rpath_e.delete(0, "end")
+                if bucket:
+                    rpath_e.insert(0, bucket + "/")
+
+            remote_o = aura.AuraOption(dlg.body, values=names, width=220,
+                                       command=remote_picked)
             remote_o.set(names[0])
             remote_o.pack(anchor="w", pady=(4, 10))
             aura.Caption(dlg.body, "Remote path (bucket/folder):").pack(
@@ -639,6 +654,7 @@ def build_app():
             rpath_e = aura.AuraEntry(dlg.body,
                                      placeholder="bucket/folder …")
             rpath_e.pack(fill="x", pady=(4, 0))
+            remote_picked(names[0])
 
             def ok(_e=None):
                 local = paths.normalize_local(local_e.get().strip())
@@ -903,9 +919,20 @@ def build_app():
             self._secret_hint = aura.Caption(body, "")
             self._secret_hint.pack(anchor="w", pady=(2, 0))
 
-            self._f_endpoint = field("Endpoint URL")
-            self._endpoint_hint = aura.Caption(body, "")
+            self._f_endpoint = field("Endpoint URL (host only — no bucket, no path)")
+            self._endpoint_hint = aura.Caption(body, "", wraplength=640,
+                                               justify="left")
             self._endpoint_hint.pack(anchor="w", pady=(2, 0))
+
+            self._f_bucket = field(
+                "Bucket — required if your credentials are scoped to one bucket")
+            self._bucket_hint = aura.Caption(
+                body,
+                "Optional otherwise. With a bucket set, Test and Browse start "
+                "inside that bucket (bucket-scoped keys — e.g. a Cloudflare R2 "
+                "token limited to one bucket — cannot list the account root).",
+                wraplength=640, justify="left")
+            self._bucket_hint.pack(anchor="w", pady=(2, 0))
 
             self._f_region = field("Region (optional)")
 
@@ -933,7 +960,7 @@ def build_app():
         def _remote_show_form(self, remote):
             self._edit_name = remote.name if remote else None
             for e in (self._f_name, self._f_access, self._f_secret,
-                      self._f_endpoint, self._f_region):
+                      self._f_endpoint, self._f_bucket, self._f_region):
                 e.delete(0, "end")
             if remote is not None:
                 self._f_name.insert(0, remote.name)
@@ -941,6 +968,8 @@ def build_app():
                 self._f_access.insert(0, remote.access_key_id)
                 if remote.endpoint:
                     self._f_endpoint.insert(0, remote.endpoint)
+                if remote.bucket:
+                    self._f_bucket.insert(0, remote.bucket)
                 if remote.region:
                     self._f_region.insert(0, remote.region)
                 self._secret_hint.configure(
@@ -964,13 +993,27 @@ def build_app():
             except Exception:
                 pass
 
+        def _sanitize_endpoint_field(self):
+            """Strip any path off the endpoint entry; return (clean, notice)."""
+            raw = self._f_endpoint.get().strip()
+            clean, stripped = rclone.sanitize_endpoint(raw)
+            if stripped:
+                self._f_endpoint.delete(0, "end")
+                self._f_endpoint.insert(0, clean)
+                notice = (f"Removed “/{stripped}” from the endpoint — bucket "
+                          "names go in the Bucket field, not the endpoint.")
+                self._endpoint_hint.configure(text=notice)
+                return clean, notice
+            return clean, ""
+
         def _remote_save(self):
             name = self._f_name.get().strip()
             label = self._f_provider.get()
             key = LABEL_TO_KEY.get(label, "other")
             access = self._f_access.get().strip()
             secret = self._f_secret.get()
-            endpoint = self._f_endpoint.get().strip()
+            endpoint, ep_notice = self._sanitize_endpoint_field()
+            bucket = self._f_bucket.get().strip().strip("/")
             region = self._f_region.get().strip()
             editing = self._edit_name is not None
 
@@ -982,14 +1025,15 @@ def build_app():
                     # already-obscured; add_remote would double-obscure, so
                     # write via build+save instead when unchanged.
                     return self._remote_save_keep_secret(
-                        name, key, access, secret, endpoint, region)
+                        name, key, access, secret, endpoint, bucket, region,
+                        ep_notice)
                 except CloudSyncError:
                     pass
 
             def work():
                 return rclone.add_remote(name, key, access, secret,
                                          endpoint=endpoint, region=region,
-                                         overwrite=editing)
+                                         bucket=bucket, overwrite=editing)
 
             def done(remote):
                 if editing and self._edit_name != remote.name:
@@ -997,19 +1041,20 @@ def build_app():
                         rclone.delete_remote(self._edit_name)
                     except CloudSyncError:
                         pass
-                self.set_success(f"Saved remote “{remote.name}”.")
+                self.set_success(f"Saved remote “{remote.name}”."
+                                 + (f"  {ep_notice}" if ep_notice else ""))
                 self._remote_hide_form()
                 self._remotes_refresh()
 
             self._bg(work, done, button=self._remote_save_btn, busy="Saving…")
 
         def _remote_save_keep_secret(self, name, key, access, obscured_secret,
-                                     endpoint, region):
+                                     endpoint, bucket, region, ep_notice=""):
             """Save an edit where the secret is unchanged (already obscured)."""
             def work():
                 remote = rclone.build_remote_section(
                     name, key, access, obscured_secret,
-                    endpoint=endpoint, region=region)
+                    endpoint=endpoint, region=region, bucket=bucket)
                 remotes = [r for r in rclone.list_remotes()
                            if r.name not in (name, self._edit_name)]
                 remotes.append(remote)
@@ -1017,7 +1062,8 @@ def build_app():
                 return remote
 
             def done(remote):
-                self.set_success(f"Saved remote “{remote.name}”.")
+                self.set_success(f"Saved remote “{remote.name}”."
+                                 + (f"  {ep_notice}" if ep_notice else ""))
                 self._remote_hide_form()
                 self._remotes_refresh()
 
@@ -1052,6 +1098,8 @@ def build_app():
             meta = remote.endpoint or "(AWS region-addressed)"
             if remote.region:
                 meta += f"   ·   {remote.region}"
+            if remote.bucket:
+                meta += f"   ·   bucket: {remote.bucket}"
             aura.Caption(card.body, meta).pack(anchor="w", pady=(4, 8))
             aura.Caption(card.body,
                          f"access key: {remote.access_key_id or '—'}   ·   "
@@ -1072,9 +1120,19 @@ def build_app():
             if not rclone.rclone_available():
                 self.set_error(rclone.NO_RCLONE_MSG)
                 return
+            bucket = self._bucket_of(name)
+            ok_msg = (f"“{name}” is reachable (tested inside bucket "
+                      f"“{bucket}”)." if bucket else f"“{name}” is reachable.")
             self._bg(lambda: rclone.test_remote(name),
-                     lambda _out: self.set_success(f"“{name}” is reachable."),
+                     lambda _out: self.set_success(ok_msg),
                      busy=f"Testing {name}…")
+
+        def _bucket_of(self, name):
+            """The configured bucket for a remote name ('' when none/unknown)."""
+            try:
+                return rclone.get_remote(name).bucket
+            except CloudSyncError:
+                return ""
 
         def _remote_delete(self, name):
             if not messagebox.askyesno(
@@ -1091,6 +1149,9 @@ def build_app():
             try:
                 self._browse_remote.set(name)
                 self._browse_path.delete(0, "end")
+                bucket = self._bucket_of(name)
+                if bucket:      # scoped credentials: start AT the bucket
+                    self._browse_path.insert(0, bucket)
                 self._browse_go()
             except Exception:
                 pass
@@ -1105,7 +1166,9 @@ def build_app():
             bar = ctk.CTkFrame(frame, fg_color="transparent")
             bar.pack(fill="x")
             aura.SectionLabel(bar, "Remote").pack(side="left")
-            self._browse_remote = aura.AuraOption(bar, values=["(none)"], width=200)
+            self._browse_remote = aura.AuraOption(
+                bar, values=["(none)"], width=200,
+                command=self._browse_remote_changed)
             self._browse_remote.pack(side="left", padx=(6, 14))
             self._browse_path = aura.AuraEntry(bar, placeholder="bucket/folder …")
             self._browse_path.pack(side="left", fill="x", expand=True)
@@ -1143,6 +1206,17 @@ def build_app():
             self._browse_remote.configure(values=names or ["(none)"])
             if names and self._browse_remote.get() not in names:
                 self._browse_remote.set(names[0])
+                self._browse_remote_changed(names[0])
+            elif names and not self._browse_path.get().strip():
+                self._browse_remote_changed(self._browse_remote.get())
+
+        def _browse_remote_changed(self, name=None):
+            """A remote with a bucket always starts browsing AT the bucket."""
+            name = name or self._browse_remote.get()
+            bucket = self._bucket_of(name) if name not in ("", "(none)") else ""
+            self._browse_path.delete(0, "end")
+            if bucket:
+                self._browse_path.insert(0, bucket)
 
         def _browse_go(self):
             name = self._browse_remote.get()
@@ -1153,6 +1227,11 @@ def build_app():
                 self.set_error(rclone.NO_RCLONE_MSG)
                 return
             path = self._browse_path.get().strip()
+            bucket = self._bucket_of(name)
+            if bucket and not path:
+                # never list the account root of a bucket-scoped remote
+                path = bucket
+                self._browse_path.insert(0, bucket)
 
             def work():
                 return rclone.list_path(name, path)
@@ -1190,6 +1269,9 @@ def build_app():
             base = self._browse_path.get().strip().strip("/")
             if not base:
                 return
+            bucket = self._bucket_of(self._browse_remote.get())
+            if bucket and base == bucket:
+                return          # the bucket is the top for scoped credentials
             parent = base.rsplit("/", 1)[0] if "/" in base else ""
             self._browse_path.delete(0, "end")
             if parent:
@@ -1210,7 +1292,9 @@ def build_app():
             rrow = ctk.CTkFrame(frame, fg_color="transparent")
             rrow.pack(fill="x", pady=6)
             aura.SectionLabel(rrow, "Remote").pack(side="left")
-            self._sync_remote = aura.AuraOption(rrow, values=["(none)"], width=200)
+            self._sync_remote = aura.AuraOption(
+                rrow, values=["(none)"], width=200,
+                command=self._sync_remote_changed)
             self._sync_remote.pack(side="left", padx=(6, 14))
             self._sync_rpath = aura.AuraEntry(rrow, placeholder="bucket/folder …")
             self._sync_rpath.pack(side="left", fill="x", expand=True)
@@ -1256,6 +1340,21 @@ def build_app():
             self._sync_remote.configure(values=names or ["(none)"])
             if names and self._sync_remote.get() not in names:
                 self._sync_remote.set(names[0])
+                self._sync_remote_changed(names[0])
+            elif names and not self._sync_rpath.get().strip():
+                self._sync_remote_changed(self._sync_remote.get())
+
+        def _sync_remote_changed(self, name=None):
+            """Prefill the remote path with the configured bucket, if any."""
+            name = name or self._sync_remote.get()
+            if name in ("", "(none)"):
+                return
+            bucket = self._bucket_of(name)
+            cur = self._sync_rpath.get().strip()
+            if bucket and (not cur or cur == bucket or
+                           not cur.startswith(bucket)):
+                self._sync_rpath.delete(0, "end")
+                self._sync_rpath.insert(0, bucket + "/")
 
         def _sync_endpoints(self):
             local = paths.normalize_local(self._sync_local.get())
@@ -1349,6 +1448,89 @@ def build_app():
                 aura.Caption(self._status_body, rclone.NO_RCLONE_MSG,
                              wraplength=760, justify="left").pack(
                     anchor="w", pady=(10, 0))
+
+        # ===============================================================
+        # Help section (in-app help, day-to-day-user tone)
+        # ===============================================================
+        def _build_help(self, frame):
+            aura.Caption(frame, VIEW_DESCRIPTIONS["help"],
+                         wraplength=780, justify="left").pack(
+                anchor="w", pady=(0, 10))
+            wrap = ctk.CTkScrollableFrame(frame, fg_color="transparent")
+            wrap.pack(fill="both", expand=True)
+
+            def topic(title, text):
+                card = aura.Card(wrap, title=title, padding=14)
+                card.pack(fill="x", pady=6)
+                ctk.CTkLabel(card.body, text=text, font=aura.font(),
+                             justify="left", anchor="w", wraplength=680
+                             ).pack(anchor="w", fill="x")
+
+            topic(
+                "Add a cloud remote",
+                "Remotes tab → “＋ Add remote”. Pick your provider, then "
+                "paste the Endpoint URL (just the host — never add a bucket "
+                "or path after it), your Access Key ID and Secret Access "
+                "Key, and save. Nothing connects until you click Test, "
+                "Browse or start a sync.")
+            topic(
+                "The Bucket field (scoped credentials)",
+                "Some credentials only work inside one bucket — a Cloudflare "
+                "R2 API token limited to a single bucket, or an AWS IAM "
+                "policy scoped to one bucket. Those credentials cannot list "
+                "your account's buckets, so a plain connection test looks "
+                "broken (“access denied”) even though the key is fine.\n\n"
+                "Fix: type that bucket's name in the remote's Bucket field. "
+                "Cloud Sync then tests, browses and syncs inside the bucket "
+                "instead of the account root. If your key can see the whole "
+                "account, leave the field empty.")
+            topic(
+                "Cloudflare R2, step by step",
+                "1. Endpoint: your bare account endpoint, e.g. "
+                "https://<account-id>.r2.cloudflarestorage.com — with "
+                "nothing after the host. If you paste a URL with a bucket "
+                "on the end, Cloud Sync removes it and tells you.\n"
+                "2. Keys: when you create an R2 API token, Cloudflare also "
+                "shows an S3 “Access Key ID” and “Secret Access Key” pair — "
+                "use those two values here. The secret is the SHA-256 hash "
+                "of the token value and is only shown at token creation; it "
+                "is NOT the token value itself. If you only kept the token, "
+                "create a new one and copy the S3 pair this time.\n"
+                "3. Scoped token? If the token was limited to one bucket, "
+                "put that bucket's name in the Bucket field.\n"
+                "4. Region: “auto” is right for R2.")
+            topic(
+                "“SignatureDoesNotMatch” — what it really means",
+                "The cloud computed a different request signature than your "
+                "key produced. Two usual causes:\n"
+                "• Wrong Secret Access Key — on R2, pasting the token value "
+                "instead of the S3 secret shown at token creation.\n"
+                "• A path after the endpoint host (a bucket name pasted "
+                "into the endpoint URL) — keep the endpoint host-only and "
+                "put the bucket in the Bucket field.")
+            topic(
+                "“Access denied” when testing",
+                "If Test fails with access denied and the Bucket field is "
+                "empty, your credentials are probably scoped to one bucket "
+                "and simply cannot list the account root. Enter the bucket "
+                "name in the Bucket field and test again. If a bucket IS "
+                "set, check its spelling matches the bucket your key is "
+                "scoped to.")
+            topic(
+                "Synced folders, transfers and safety",
+                "Synced folders keep a local folder and a remote path in "
+                "step — realtime by default, or on a schedule. Conflicts "
+                "never lose data: the newer file wins and the other version "
+                "is kept as a “conflicted copy”. One-off transfers live in "
+                "the Transfer tab; “Preview (dry run)” shows what would "
+                "change before anything is touched, and mirror mode asks "
+                "before it can delete on the destination.")
+            topic(
+                "Where your settings live",
+                "Remotes (with secrets obscured) are stored in Cloud Sync's "
+                "own rclone.conf at:\n" + str(paths.default_config_path()) +
+                "\nCloud Sync never touches your global rclone config, "
+                "sends no telemetry, and connects only when you ask it to.")
 
         # ---- lifecycle
         def _on_close(self):

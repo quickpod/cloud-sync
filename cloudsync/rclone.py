@@ -73,7 +73,11 @@ PROVIDERS: Tuple[Provider, ...] = (
              "", "Region-addressed; leave endpoint blank."),
     Provider("r2", "Cloudflare R2", "Cloudflare", True, "auto",
              "https://<account-id>.r2.cloudflarestorage.com",
-             "Find your endpoint in the R2 dashboard."),
+             "Bare account endpoint — no bucket name in the URL. Use the "
+             "Access Key ID + Secret Access Key shown when the API token is "
+             "created (the secret is the SHA-256 hash of the token value, "
+             "not the token itself). Token scoped to one bucket? Put that "
+             "bucket in the Bucket field."),
     Provider("b2", "Backblaze B2 (S3)", "Other", True, "",
              "https://s3.<region>.backblazeb2.com",
              "Use the S3-compatible endpoint shown in your B2 bucket."),
@@ -113,6 +117,14 @@ def get_provider(key: str) -> Provider:
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.-]*$")
 # Keys that hold a secret and must never be printed/logged.
 SECRET_KEYS = ("secret_access_key", "session_token", "sse_kms_key_id")
+
+# App-side key: the bucket this remote's credentials are scoped to (optional).
+# Stored inside the remote's rclone.conf section.  rclone ignores config keys
+# it does not know (verified against rclone: an ``lsd`` through a section
+# carrying this key succeeds with no warning), and parse/render round-trip it
+# losslessly like any other unknown key, so it travels with the remote without
+# ever affecting rclone itself.
+BUCKET_KEY = "cloudsync_bucket"
 
 
 def validate_remote_name(name: str) -> str:
@@ -165,6 +177,11 @@ class Remote:
         return self.params.get("access_key_id", "")
 
     @property
+    def bucket(self) -> str:
+        """The bucket these credentials are scoped to ('' when unscoped)."""
+        return self.params.get(BUCKET_KEY, "").strip().strip("/")
+
+    @property
     def provider_key(self) -> str:
         """Best-effort reverse map to a :class:`Provider` key (for the form)."""
         if self.type != "s3":
@@ -185,9 +202,84 @@ class Remote:
             "provider_key": self.provider_key,
             "endpoint": self.endpoint,
             "region": self.region,
+            "bucket": self.bucket,
             "access_key_id": self.access_key_id,
             "has_secret": bool(self.params.get("secret_access_key")),
         }
+
+
+def sanitize_endpoint(endpoint: str) -> Tuple[str, str]:
+    """Reduce an S3-style endpoint to scheme+host and report what was cut (pure).
+
+    S3 endpoints must be bare hosts: anything after the host (usually a bucket
+    name pasted into the URL, e.g.
+    ``https://<account>.r2.cloudflarestorage.com/mybucket/``) breaks AWS SigV4
+    request signing, and every call then fails with a baffling
+    ``SignatureDoesNotMatch``.  Returns ``(clean_endpoint, stripped)`` where
+    *stripped* is the removed path/query/fragment (``''`` when nothing
+    meaningful was removed — a bare trailing slash does not count).  Handles
+    scheme-less endpoints (``minio.example.com:9000/foo``) and returns
+    ``('', '')`` for empty input.
+    """
+    ep = (endpoint or "").strip()
+    if not ep:
+        return "", ""
+    from urllib.parse import urlsplit
+    has_scheme = "://" in ep
+    try:
+        parts = urlsplit(ep if has_scheme else "//" + ep)
+    except ValueError:
+        return ep, ""
+    if not parts.netloc:          # unparseable — leave it alone
+        return ep, ""
+    stripped = parts.path
+    if parts.query:
+        stripped += "?" + parts.query
+    if parts.fragment:
+        stripped += "#" + parts.fragment
+    stripped = stripped.strip("/")
+    clean = (parts.scheme + "://" + parts.netloc) if has_scheme else parts.netloc
+    return clean, stripped
+
+
+def friendly_test_error(message: str, *, bucket: str = "") -> str:
+    """Map a raw rclone connectivity error to an actionable message (pure).
+
+    Recognises the two classic S3-credential traps; anything else passes
+    through unchanged:
+
+    * ``SignatureDoesNotMatch`` — wrong secret (on Cloudflare R2, people paste
+      the token value instead of the derived S3 secret) or an endpoint with a
+      path appended.
+    * Access denied on the account root — bucket-scoped credentials (R2
+      tokens, S3 IAM policies) cannot ListBuckets; point the user at the
+      Bucket field instead of dumping a 403.
+    """
+    msg = (message or "").strip()
+    low = msg.lower()
+    if "signaturedoesnotmatch" in low:
+        return ("The cloud rejected the request signature "
+                "(SignatureDoesNotMatch). Check your Secret Access Key — for "
+                "Cloudflare R2 that is the S3 secret shown when the API token "
+                "was created (the SHA-256 hash of the token value), not the "
+                "token value itself — and make sure the Endpoint URL is just "
+                "the host, with no path after it.")
+    denied = ("accessdenied" in low or "access denied" in low
+              or "status code: 403" in low or "error 403" in low
+              or "403 forbidden" in low or "http 403" in low)
+    if denied and not bucket:
+        return ("The cloud refused to list your account's buckets (access "
+                "denied). Credentials scoped to a single bucket — common "
+                "with Cloudflare R2 API tokens and S3 IAM policies — cannot "
+                "list buckets even though they work fine inside their own "
+                "bucket. Enter that bucket's name in the remote's Bucket "
+                "field, save, and test again.")
+    if denied and bucket:
+        return (f"Access denied inside bucket {bucket!r}. Check that the "
+                "bucket name exactly matches the one your credentials are "
+                "scoped to, and that the Access Key ID / Secret Access Key "
+                "pair is correct.")
+    return msg
 
 
 def build_remote_section(
@@ -198,20 +290,25 @@ def build_remote_section(
     *,
     endpoint: Optional[str] = None,
     region: Optional[str] = None,
+    bucket: Optional[str] = None,
 ) -> Remote:
     """Turn the friendly add-remote form fields into a :class:`Remote` (pure).
 
     ``secret_access_key`` is stored verbatim -- callers that talk to a real
-    rclone should pass the value returned by :func:`obscure` first.  Validates
-    the name, provider and required endpoint, and raises
-    :class:`CloudSyncError` on anything unusable.
+    rclone should pass the value returned by :func:`obscure` first.  The
+    endpoint is reduced to scheme+host via :func:`sanitize_endpoint` (a path
+    in an S3 endpoint breaks SigV4 signing); ``bucket`` is the optional
+    bucket the credentials are scoped to, stored app-side under
+    :data:`BUCKET_KEY`.  Validates the name, provider and required endpoint,
+    and raises :class:`CloudSyncError` on anything unusable.
     """
     name = validate_remote_name(name)
     prov = get_provider(provider_key)
     access_key_id = (access_key_id or "").strip()
     secret_access_key = secret_access_key or ""
-    endpoint = (endpoint or "").strip()
+    endpoint, _ = sanitize_endpoint(endpoint or "")
     region = (region or "").strip() or prov.default_region
+    bucket = (bucket or "").strip().strip("/")
 
     if not access_key_id:
         raise CloudSyncError("Enter the access key ID.")
@@ -232,6 +329,8 @@ def build_remote_section(
         params["endpoint"] = endpoint
     if region:
         params["region"] = region
+    if bucket:
+        params[BUCKET_KEY] = bucket
     return Remote(name=name, params=params)
 
 
@@ -558,7 +657,8 @@ def obscure(secret: str) -> str:
 
 def add_remote(name: str, provider_key: str, access_key_id: str,
                secret_access_key: str, *, endpoint: Optional[str] = None,
-               region: Optional[str] = None, overwrite: bool = False) -> Remote:
+               region: Optional[str] = None, bucket: Optional[str] = None,
+               overwrite: bool = False) -> Remote:
     """Validate, obscure the secret, and persist a new remote.
 
     The secret is obscured via rclone when available; if rclone is missing the
@@ -575,7 +675,7 @@ def add_remote(name: str, provider_key: str, access_key_id: str,
         stored_secret = obscure(secret_access_key)
     remote = build_remote_section(
         name, provider_key, access_key_id, stored_secret,
-        endpoint=endpoint, region=region)
+        endpoint=endpoint, region=region, bucket=bucket)
     remotes = [r for r in remotes if r.name != name]
     remotes.append(remote)
     save_remotes(remotes)
@@ -595,14 +695,33 @@ def delete_remote(name: str) -> None:
 # Cloud operations (user-initiated only — nothing here runs on its own)
 # --------------------------------------------------------------------------- #
 def test_remote(name: str) -> str:
-    """Connectivity check: list the remote's top level (privileged, network).
+    """Connectivity check (privileged, network) — bucket-aware.
 
     Only ever called when the user clicks "Test" / runs ``cloudsync test``.
-    Returns rclone's stdout on success; a clean error otherwise.
+    When the remote has a bucket configured (:data:`BUCKET_KEY`) the check
+    lists *inside* that bucket — ``lsd remote:bucket`` — because bucket-scoped
+    credentials (Cloudflare R2 tokens, S3 IAM policies) cannot ListBuckets at
+    the account root; if that fails, it falls back to statting the bucket
+    itself before giving up.  Without a bucket it lists the account root as
+    before.  Failures are mapped through :func:`friendly_test_error` so the
+    user gets an actionable message, never a raw 403 dump.
     """
-    if not remote_exists(name):
-        raise CloudSyncError(f"No remote named {name!r}.")
-    return _run(["lsd", remote_path(name)], timeout=60)
+    remote = get_remote(name)          # raises "No remote named ..." if absent
+    bucket = remote.bucket
+    try:
+        return _run(["lsd", remote_path(name, bucket)], timeout=60)
+    except CloudSyncError as exc:
+        if bucket:
+            # Some gateways refuse lsd on a bucket root; statting the bucket
+            # object is the cheapest call that still proves the credentials
+            # work inside it.
+            try:
+                _run(["lsjson", "--stat", remote_path(name, bucket)],
+                     timeout=60)
+                return ""
+            except CloudSyncError:
+                pass
+        raise CloudSyncError(friendly_test_error(str(exc), bucket=bucket))
 
 
 def list_path(remote_name: str, path: str = "") -> List[Entry]:
@@ -614,10 +733,10 @@ def list_path(remote_name: str, path: str = "") -> List[Entry]:
 
 
 def about(name: str) -> Dict[str, Optional[int]]:
-    """Storage usage for a remote via ``rclone about --json`` (privileged)."""
-    if not remote_exists(name):
-        raise CloudSyncError(f"No remote named {name!r}.")
-    out = _run(["about", remote_path(name), "--json"], timeout=60)
+    """Storage usage via ``rclone about --json`` (privileged, bucket-aware)."""
+    remote = get_remote(name)
+    out = _run(["about", remote_path(name, remote.bucket), "--json"],
+               timeout=60)
     return parse_about(out)
 
 

@@ -16,15 +16,18 @@ import pytest
 
 import cloudsync
 from cloudsync import (
+    BUCKET_KEY,
     CloudSyncError,
     build_remote_section,
     build_sync_args,
+    friendly_test_error,
     human_size,
     parse_about,
     parse_config,
     parse_lsjson,
     remote_path,
     render_config,
+    sanitize_endpoint,
     validate_remote_name,
 )
 from cloudsync import paths, rclone
@@ -106,6 +109,95 @@ def test_build_remote_section_requires_keys():
         build_remote_section("x", "aws", "AK", "")
 
 
+def test_build_remote_section_stores_bucket_under_app_key():
+    r = build_remote_section("r2a", "r2", "AK", "sekret",
+                             endpoint="https://192.0.2.30", bucket="/mybkt/")
+    assert r.params[BUCKET_KEY] == "mybkt"      # slashes trimmed
+    assert r.bucket == "mybkt"
+    assert r.as_dict()["bucket"] == "mybkt"
+    # no bucket -> key entirely absent (round-trips as before)
+    r2 = build_remote_section("r2b", "r2", "AK", "sekret",
+                              endpoint="https://192.0.2.30")
+    assert BUCKET_KEY not in r2.params
+    assert r2.bucket == ""
+
+
+def test_build_remote_section_sanitizes_endpoint_path():
+    r = build_remote_section("r2a", "r2", "AK", "sekret",
+                             endpoint="https://192.0.2.30/abcd/")
+    assert r.params["endpoint"] == "https://192.0.2.30"
+
+
+# --------------------------------------------------------------------------- #
+# Endpoint sanitization (defect 2: a path in the endpoint breaks SigV4)
+# --------------------------------------------------------------------------- #
+def test_sanitize_endpoint_strips_path():
+    clean, stripped = sanitize_endpoint(
+        "https://acct.r2.cloudflarestorage.com/abcd/")
+    assert clean == "https://acct.r2.cloudflarestorage.com"
+    assert stripped == "abcd"
+
+
+def test_sanitize_endpoint_trailing_slash_is_not_a_path():
+    clean, stripped = sanitize_endpoint("https://192.0.2.30/")
+    assert clean == "https://192.0.2.30"
+    assert stripped == ""
+
+
+def test_sanitize_endpoint_untouched_when_clean():
+    clean, stripped = sanitize_endpoint("https://192.0.2.30:9000")
+    assert (clean, stripped) == ("https://192.0.2.30:9000", "")
+
+
+def test_sanitize_endpoint_deep_path_query_and_fragment():
+    clean, stripped = sanitize_endpoint(
+        "https://192.0.2.30/bkt/sub/?x=1#frag")
+    assert clean == "https://192.0.2.30"
+    assert stripped == "bkt/sub/?x=1#frag".strip("/")
+
+
+def test_sanitize_endpoint_schemeless():
+    clean, stripped = sanitize_endpoint("minio.example.com:9000/data/")
+    assert clean == "minio.example.com:9000"
+    assert stripped == "data"
+
+
+def test_sanitize_endpoint_empty():
+    assert sanitize_endpoint("") == ("", "")
+    assert sanitize_endpoint("   ") == ("", "")
+
+
+# --------------------------------------------------------------------------- #
+# Connectivity-error mapping (defect 1: raw 403s are unactionable)
+# --------------------------------------------------------------------------- #
+def test_friendly_test_error_signature_mismatch():
+    msg = friendly_test_error(
+        "ERROR : : error listing: SignatureDoesNotMatch: status code 403")
+    assert "Secret Access Key" in msg
+    assert "SHA-256" in msg
+    assert "no path" in msg
+
+
+def test_friendly_test_error_access_denied_root_suggests_bucket_field():
+    msg = friendly_test_error(
+        "ERROR : AccessDenied: Access Denied, status code: 403")
+    assert "Bucket field" in msg
+    assert "scoped" in msg
+    assert "403" not in msg          # no raw status dump
+
+
+def test_friendly_test_error_access_denied_with_bucket():
+    msg = friendly_test_error(
+        "AccessDenied: Access Denied, status code: 403", bucket="mybkt")
+    assert "mybkt" in msg
+    assert "scoped" in msg
+
+
+def test_friendly_test_error_passthrough():
+    other = "connection refused: dial tcp 192.0.2.30:443"
+    assert friendly_test_error(other) == other
+
+
 # --------------------------------------------------------------------------- #
 # Config INI round-trip
 # --------------------------------------------------------------------------- #
@@ -138,6 +230,20 @@ def test_parse_config_preserves_unknown_keys():
     assert remotes[0].params["storage_class"] == "GLACIER"
     # round-trips back out unchanged
     assert "storage_class = GLACIER" in render_config(remotes)
+
+
+def test_config_roundtrip_preserves_bucket_key_losslessly():
+    r = build_remote_section("r2a", "r2", "AK", "obscured",
+                             endpoint="https://192.0.2.30", bucket="mybkt")
+    text = render_config([r])
+    assert f"{BUCKET_KEY} = mybkt" in text
+    again = parse_config(text)
+    assert again[0].bucket == "mybkt"
+    assert again[0].params == r.params
+    # and a config written by hand round-trips too
+    hand = f"[x]\ntype = s3\n{BUCKET_KEY} = other-bkt\n"
+    assert parse_config(hand)[0].bucket == "other-bkt"
+    assert f"{BUCKET_KEY} = other-bkt" in render_config(parse_config(hand))
 
 
 def test_parse_config_percent_in_value_is_literal():
@@ -330,6 +436,79 @@ def test_test_remote_unknown_raises():
 
 
 # --------------------------------------------------------------------------- #
+# Bucket-aware test / browse / about (bucket-scoped credentials, e.g. R2)
+# --------------------------------------------------------------------------- #
+def test_add_remote_persists_bucket(fake_rclone):
+    rclone.add_remote("r2a", "r2", "AK", "s",
+                      endpoint=OTHER_ENDPOINT, bucket="mybkt")
+    assert rclone.get_remote("r2a").bucket == "mybkt"
+
+
+def test_test_remote_without_bucket_lists_root(fake_rclone):
+    rclone.add_remote("lab", "minio", "AK", "s", endpoint=MINIO_ENDPOINT)
+    fake_rclone.clear()
+    rclone.test_remote("lab")
+    assert fake_rclone[-1][-2:] == ["lsd", "lab:"]
+
+
+def test_test_remote_with_bucket_lists_the_bucket(fake_rclone):
+    rclone.add_remote("r2a", "r2", "AK", "s",
+                      endpoint=OTHER_ENDPOINT, bucket="mybkt")
+    fake_rclone.clear()
+    rclone.test_remote("r2a")
+    assert fake_rclone[-1][-2:] == ["lsd", "r2a:mybkt"]
+
+
+def test_test_remote_bucket_falls_back_to_stat(fake_rclone, monkeypatch):
+    rclone.add_remote("r2a", "r2", "AK", "s",
+                      endpoint=OTHER_ENDPOINT, bucket="mybkt")
+    calls = []
+
+    def picky(argv, timeout=120):
+        calls.append(argv)
+        if "lsd" in argv:
+            return 1, "", "ERROR : some gateways refuse lsd on a bucket"
+        return 0, "{}", ""
+
+    monkeypatch.setattr(rclone, "_execute", picky)
+    rclone.test_remote("r2a")                    # must not raise
+    assert any("--stat" in c for c in calls)
+    assert calls[-1][-1] == "r2a:mybkt"
+
+
+def test_test_remote_maps_access_denied_to_bucket_hint(fake_rclone, monkeypatch):
+    rclone.add_remote("r2a", "r2", "AK", "s", endpoint=OTHER_ENDPOINT)
+    monkeypatch.setattr(
+        rclone, "_execute",
+        lambda argv, timeout=120:
+            (1, "", "ERROR : : error listing: AccessDenied: Access Denied, "
+                    "status code: 403"))
+    with pytest.raises(CloudSyncError) as ei:
+        rclone.test_remote("r2a")
+    assert "Bucket field" in str(ei.value)
+
+
+def test_test_remote_maps_signature_mismatch(fake_rclone, monkeypatch):
+    rclone.add_remote("r2a", "r2", "AK", "s",
+                      endpoint=OTHER_ENDPOINT, bucket="mybkt")
+    monkeypatch.setattr(
+        rclone, "_execute",
+        lambda argv, timeout=120:
+            (1, "", "ERROR : SignatureDoesNotMatch: status code: 403"))
+    with pytest.raises(CloudSyncError) as ei:
+        rclone.test_remote("r2a")
+    assert "Secret Access Key" in str(ei.value)
+
+
+def test_about_uses_bucket_when_set(fake_rclone):
+    rclone.add_remote("r2a", "r2", "AK", "s",
+                      endpoint=OTHER_ENDPOINT, bucket="mybkt")
+    fake_rclone.clear()
+    rclone.about("r2a")
+    assert "r2a:mybkt" in fake_rclone[-1]
+
+
+# --------------------------------------------------------------------------- #
 # GUI: headless-safe entry point (catches ImportError, returns 0)
 # --------------------------------------------------------------------------- #
 def test_gui_module_imports_without_display():
@@ -349,5 +528,6 @@ def test_gui_main_degrades_on_missing_ctk(monkeypatch):
 
 def test_public_api_surface():
     for name in ("add_remote", "sync", "list_path", "rclone_available",
-                 "PROVIDERS", "paths"):
+                 "PROVIDERS", "paths", "sanitize_endpoint",
+                 "friendly_test_error", "BUCKET_KEY"):
         assert hasattr(cloudsync, name)
