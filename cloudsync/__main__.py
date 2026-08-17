@@ -98,7 +98,7 @@ def cmd_add(a):
     remote = add_remote(a.name, prov.key, a.access_key, secret,
                         endpoint=a.endpoint, region=a.region,
                         bucket=a.bucket, overwrite=a.force)
-    where = "obscured and saved" if rclone_available() else "saved (rclone not installed)"
+    where = "saved" if rclone_available() else "saved (rclone not installed)"
     print(f"Remote {remote.name!r} ({remote.provider_label()}) {where}.")
     if not rclone_available():
         print(NO_RCLONE_MSG)
@@ -218,7 +218,7 @@ def build_parser():
     s = add("remotes", "List your configured remotes (secrets redacted)", cmd_remotes)
     s.add_argument("--json", action="store_true", help="emit JSON")
 
-    s = add("add", "Add or update a remote (offline; secret is obscured)", cmd_add)
+    s = add("add", "Add or update a remote (offline; nothing is contacted)", cmd_add)
     s.add_argument("name", help="a name for this remote, e.g. 'work-s3'")
     s.add_argument("--provider", required=True,
                    help="provider key (see 'cloudsync providers')")

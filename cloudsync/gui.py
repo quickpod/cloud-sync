@@ -1022,8 +1022,8 @@ def build_app():
                 try:
                     secret = rclone.get_remote(self._edit_name).params.get(
                         "secret_access_key", "")
-                    # already-obscured; add_remote would double-obscure, so
-                    # write via build+save instead when unchanged.
+                    # Reuse the stored key as-is; it is already the literal
+                    # secret, so it needs no further encoding.
                     return self._remote_save_keep_secret(
                         name, key, access, secret, endpoint, bucket, region,
                         ep_notice)
@@ -1048,12 +1048,12 @@ def build_app():
 
             self._bg(work, done, button=self._remote_save_btn, busy="Saving…")
 
-        def _remote_save_keep_secret(self, name, key, access, obscured_secret,
+        def _remote_save_keep_secret(self, name, key, access, stored_secret,
                                      endpoint, bucket, region, ep_notice=""):
-            """Save an edit where the secret is unchanged (already obscured)."""
+            """Save an edit where the secret is unchanged (reused verbatim)."""
             def work():
                 remote = rclone.build_remote_section(
-                    name, key, access, obscured_secret,
+                    name, key, access, stored_secret,
                     endpoint=endpoint, region=region, bucket=bucket)
                 remotes = [r for r in rclone.list_remotes()
                            if r.name not in (name, self._edit_name)]
@@ -1527,8 +1527,8 @@ def build_app():
                 "before it can delete on the destination.")
             topic(
                 "Where your settings live",
-                "Remotes (with secrets obscured) are stored in Cloud Sync's "
-                "own rclone.conf at:\n" + str(paths.default_config_path()) +
+                "Remotes are stored in Cloud Sync's own rclone.conf (readable "
+                "only by you) at:\n" + str(paths.default_config_path()) +
                 "\nCloud Sync never touches your global rclone config, "
                 "sends no telemetry, and connects only when you ask it to.")
 

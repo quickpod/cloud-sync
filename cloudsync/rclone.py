@@ -294,8 +294,9 @@ def build_remote_section(
 ) -> Remote:
     """Turn the friendly add-remote form fields into a :class:`Remote` (pure).
 
-    ``secret_access_key`` is stored verbatim -- callers that talk to a real
-    rclone should pass the value returned by :func:`obscure` first.  The
+    ``secret_access_key`` is stored verbatim, which is what rclone's S3
+    backend expects -- passing an obscured value here breaks request
+    signing.  The
     endpoint is reduced to scheme+host via :func:`sanitize_endpoint` (a path
     in an S3 endpoint breaks SigV4 signing); ``bucket`` is the optional
     bucket the credentials are scoped to, stored app-side under
@@ -603,9 +604,66 @@ def _read_config_text() -> str:
         raise CloudSyncError(f"Could not read the config file {cfg}: {exc}.")
 
 
+def _looks_obscured(secret: str) -> bool:
+    """True when *secret* is an ``rclone obscure`` blob rather than a real key.
+
+    Older versions stored ``secret_access_key`` obscured, which rclone then
+    signed with literally -- so those configs fail with
+    ``SignatureDoesNotMatch`` until the value is turned back into the key the
+    user typed.  ``rclone reveal`` alone is not a sufficient test: a 64-hex R2
+    secret is valid base64 and "reveals" to binary garbage.  Requiring the
+    result to be printable ASCII separates a genuine blob from that case.
+    """
+    return _reveal_or_none(secret) is not None
+
+
+def _reveal_or_none(secret: str) -> Optional[str]:
+    """Return the literal key behind an obscured *secret*, or None if it is
+    already literal.  Shared by the detector and the migration so both agree.
+    """
+    if not secret:
+        return None
+    path = _rclone_path()
+    if not path:
+        return None
+    argv = [path, "--config", str(paths.default_config_path()), "reveal", secret]
+    try:
+        rc, out, _ = _execute(argv, timeout=15)
+    except CloudSyncError:
+        return None
+    if rc != 0:
+        return None
+    revealed = (out or "").strip()
+    if not revealed or not revealed.isascii() or not revealed.isprintable():
+        return None
+    return revealed
+
+
+def _migrate_obscured_secrets(remotes: List[Remote]) -> List[Remote]:
+    """Rewrite any obscured secret back to the literal key, in place.
+
+    Runs at most once per remote: after the config has been rewritten the
+    secrets are plain and :func:`_looks_obscured` stops matching them.  Failure
+    to write is non-fatal -- the revealed values are still returned so the
+    session works even on a read-only config.
+    """
+    changed = False
+    for remote in remotes:
+        revealed = _reveal_or_none(remote.params.get("secret_access_key", ""))
+        if revealed:
+            remote.params["secret_access_key"] = revealed
+            changed = True
+    if changed:
+        try:
+            save_remotes(remotes)
+        except CloudSyncError:
+            pass
+    return remotes
+
+
 def list_remotes() -> List[Remote]:
     """Return every configured remote (read from Cloud Sync's rclone.conf)."""
-    return parse_config(_read_config_text())
+    return _migrate_obscured_secrets(parse_config(_read_config_text()))
 
 
 def remote_names() -> List[str]:
@@ -659,10 +717,13 @@ def add_remote(name: str, provider_key: str, access_key_id: str,
                secret_access_key: str, *, endpoint: Optional[str] = None,
                region: Optional[str] = None, bucket: Optional[str] = None,
                overwrite: bool = False) -> Remote:
-    """Validate, obscure the secret, and persist a new remote.
+    """Validate and persist a new remote.
 
-    The secret is obscured via rclone when available; if rclone is missing the
-    remote is still saved (secret stored as typed) so setup can happen offline.
+    The secret is stored exactly as typed.  rclone's S3 backend reads
+    ``secret_access_key`` verbatim and signs requests with it, so anything
+    other than the literal key -- including an ``rclone obscure`` blob -- makes
+    every request fail with ``SignatureDoesNotMatch``.  Confidentiality comes
+    from the config file's 0600 permissions, not from encoding the value.
     Raises if the name already exists and ``overwrite`` is False.
     """
     name = validate_remote_name(name)
@@ -670,11 +731,10 @@ def add_remote(name: str, provider_key: str, access_key_id: str,
     if any(r.name == name for r in remotes) and not overwrite:
         raise CloudSyncError(
             f"A remote named {name!r} already exists. Pick another name or edit it.")
-    stored_secret = secret_access_key
-    if rclone_available():
-        stored_secret = obscure(secret_access_key)
+    if not (secret_access_key or "").strip():
+        raise CloudSyncError("Enter the secret access key.")
     remote = build_remote_section(
-        name, provider_key, access_key_id, stored_secret,
+        name, provider_key, access_key_id, secret_access_key,
         endpoint=endpoint, region=region, bucket=bucket)
     remotes = [r for r in remotes if r.name != name]
     remotes.append(remote)

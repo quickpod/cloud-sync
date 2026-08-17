@@ -388,12 +388,56 @@ def test_add_list_delete_remote_roundtrip_offline(monkeypatch):
         rclone.delete_remote("lab")
 
 
-def test_add_remote_obscures_secret_when_rclone_present(fake_rclone):
+def test_add_remote_stores_secret_verbatim(fake_rclone):
+    # rclone's S3 backend signs with secret_access_key exactly as written, so
+    # storing anything but the literal key (an `rclone obscure` blob, say)
+    # makes every request fail with SignatureDoesNotMatch.
     rclone.add_remote("lab", "minio", "AK", "topsecret", endpoint=MINIO_ENDPOINT)
     r = rclone.get_remote("lab")
-    assert r.params["secret_access_key"] == "OBSCURED(topsecret)"
+    assert r.params["secret_access_key"] == "topsecret"
+    assert not any("obscure" in argv for argv in fake_rclone)
     # every rclone call was pinned to our dedicated --config file
     assert all(c[1] == "--config" for c in fake_rclone)
+
+
+def test_add_remote_rejects_empty_secret(fake_rclone):
+    with pytest.raises(CloudSyncError):
+        rclone.add_remote("lab", "minio", "AK", "   ", endpoint=MINIO_ENDPOINT)
+
+
+def test_obscured_secret_from_older_config_is_migrated(monkeypatch):
+    """A config written by the obscuring versions is repaired on first read."""
+    monkeypatch.setattr(rclone, "_rclone_path", lambda: None)
+    rclone.add_remote("lab", "minio", "AK", "OBSCUREDBLOB", endpoint=MINIO_ENDPOINT)
+
+    monkeypatch.setattr(rclone, "_rclone_path", lambda: "/usr/bin/rclone")
+    monkeypatch.setattr(
+        rclone, "_execute",
+        lambda argv, timeout=120: (0, "real-secret", "") if "reveal" in argv
+        else (0, "", ""))
+
+    assert rclone.get_remote("lab").params["secret_access_key"] == "real-secret"
+    # persisted, so the reveal happens once rather than on every read
+    assert "real-secret" in paths.default_config_path().read_text()
+
+
+def test_plain_secret_that_looks_base64_is_left_alone(monkeypatch):
+    """A 64-hex key decodes as base64 but reveals to bytes, not a real key.
+
+    Guards the migration against corrupting keys that merely *look* obscured.
+    """
+    monkeypatch.setattr(rclone, "_rclone_path", lambda: None)
+    hex_secret = "a" * 64
+    rclone.add_remote("r2", "minio", "AK", hex_secret, endpoint=MINIO_ENDPOINT)
+
+    monkeypatch.setattr(rclone, "_rclone_path", lambda: "/usr/bin/rclone")
+    # rclone "reveals" it to non-printable bytes; the helper must reject that
+    monkeypatch.setattr(
+        rclone, "_execute",
+        lambda argv, timeout=120: (0, "\x01\x02 garbage\x7f", "") if "reveal" in argv
+        else (0, "", ""))
+
+    assert rclone.get_remote("r2").params["secret_access_key"] == hex_secret
 
 
 def test_config_file_is_written_with_tight_perms(monkeypatch, tmp_path):
