@@ -13,8 +13,15 @@ if os.name == "nt":
         pass
 
 
+#: Flags that belong to the GUI, not the CLI (autostart passes --minimized).
+GUI_FLAGS = {"--minimized", "--tray"}
+
+
 def main():
     argv = sys.argv[1:]
+    if argv and set(argv) <= GUI_FLAGS:
+        from cloudsync import gui
+        return gui.main(argv) or 0
     if argv:
         from cloudsync import __main__ as cli
         if hasattr(cli, 'main'):

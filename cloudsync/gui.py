@@ -83,6 +83,10 @@ VIEW_DESCRIPTIONS = {
 # ---------------------------------------------------------------------------
 # Asset / frozen handling
 # ---------------------------------------------------------------------------
+#: Set by :func:`main` from ``--minimized``: start hidden in the tray.
+START_MINIMIZED = False
+
+
 def asset_path(name):
     """Locate a bundled asset from source OR a PyInstaller one-file build."""
     roots = []
@@ -127,7 +131,7 @@ def build_app():
     from tkinter import ttk, filedialog, messagebox
     import customtkinter as ctk
 
-    from . import aura, guiconfig, paths
+    from . import aura, autostart, guiconfig, paths, tray
     from .errors import CloudSyncError
     from . import rclone, syncengine
     from .rclone import (
@@ -183,6 +187,9 @@ def build_app():
             self._browse_history = []       # path breadcrumbs for the Up button
             self.engine = None              # the continuous-sync engine
             self._activity = []             # newest-first activity rows
+            self._tray = None               # tray indicator (None when absent)
+            self._hidden = False            # window hidden but still syncing
+            self._quitting = False          # a real quit, not a hide-to-tray
 
             self._set_icon()
             self._build_menu()
@@ -200,6 +207,11 @@ def build_app():
             self.set_status("Ready")
             self.protocol("WM_DELETE_WINDOW", self._on_close)
             self.after(200, self._start_engine)
+            self._start_tray()
+            if START_MINIMIZED:
+                # Launched at login: go straight to the tray. Without a tray
+                # there would be no way back, so only hide when one exists.
+                self.after(300, self._hide_to_tray_if_possible)
 
         # ---- assets / icon
         def _set_icon(self):
@@ -367,6 +379,7 @@ def build_app():
                     text_color=aura.P(color) if color else aura.P("muted"))
             except Exception:
                 pass
+            self._sync_tray_state(overall)
 
         def _sync_now(self):
             if self.engine is None or not self._config_pairs():
@@ -739,6 +752,49 @@ def build_app():
                     self.set_error("Daily time must be HH:MM (e.g. 21:30).")
             daily_e.bind("<Return>", apply_daily)
             daily_e.bind("<FocusOut>", apply_daily)
+
+            aura.SectionLabel(dlg.body, "Background & startup").pack(
+                anchor="w", pady=(14, 2))
+            if tray.available():
+                tray_sw = ctk.CTkSwitch(
+                    dlg.body, text="Keep syncing in the tray when I close the "
+                    "window", command=lambda: guiconfig.set_close_to_tray(
+                        bool(tray_sw.get())))
+                tray_sw.select() if guiconfig.get_close_to_tray() \
+                    else tray_sw.deselect()
+                tray_sw.pack(anchor="w", pady=(4, 2))
+
+                start_sw = ctk.CTkSwitch(
+                    dlg.body, text="Start hidden in the tray",
+                    command=lambda: guiconfig.set_start_minimized(
+                        bool(start_sw.get())))
+                start_sw.select() if guiconfig.get_start_minimized() \
+                    else start_sw.deselect()
+                start_sw.pack(anchor="w", pady=(2, 2))
+            else:
+                aura.Caption(
+                    dlg.body,
+                    "This desktop has no system tray, so Cloud Sync stops "
+                    "when you close the window.").pack(anchor="w")
+
+            if autostart.is_supported():
+                auto_sw = ctk.CTkSwitch(
+                    dlg.body, text="Start Cloud Sync when I log in",
+                    command=lambda: apply_autostart(bool(auto_sw.get())))
+                # Reflect what is actually registered, not just our preference:
+                # the user may have removed it with the desktop's own tool.
+                auto_sw.select() if autostart.is_enabled() else auto_sw.deselect()
+                auto_sw.pack(anchor="w", pady=(2, 2))
+
+                def apply_autostart(flag):
+                    if autostart.set_enabled(flag):
+                        guiconfig.set_autostart(flag)
+                        self.set_success("Cloud Sync will start at login."
+                                         if flag else
+                                         "Cloud Sync will no longer start at login.")
+                    else:
+                        auto_sw.deselect() if flag else auto_sw.select()
+                        self.set_error("Could not change the startup setting.")
 
             aura.SectionLabel(dlg.body, "Appearance").pack(anchor="w",
                                                            pady=(14, 2))
@@ -1532,9 +1588,107 @@ def build_app():
                 "\nCloud Sync never touches your global rclone config, "
                 "sends no telemetry, and connects only when you ask it to.")
 
+        # ---- tray
+        def _start_tray(self):
+            """Create the tray indicator; harmless when one isn't available."""
+            if not tray.available():
+                return
+            self._tray = tray.TrayIcon(
+                on_open=lambda: self._from_tray(self._show_from_tray),
+                on_sync_now=lambda: self._from_tray(self._tray_sync_now),
+                on_toggle_pause=lambda: self._from_tray(self._toggle_pause),
+                on_quit=lambda: self._from_tray(self._quit_from_tray),
+                title=APP_NAME)
+            if not self._tray.start():
+                self._tray = None
+                return
+            self._sync_tray_state()
+
+        def _from_tray(self, fn):
+            """Run a tray menu handler on the Tk thread (pystray calls us
+            from its own thread, and Tk is not thread-safe)."""
+            try:
+                self.after(0, fn)
+            except Exception:
+                pass
+
+        def _sync_tray_state(self, overall=None):
+            """Push the current engine state onto the tray indicator."""
+            if self._tray is None:
+                return
+            eng = self.engine
+            paused = bool(eng.paused) if eng is not None else \
+                bool(guiconfig.get_paused())
+            if eng is None or not self._config_pairs():
+                state, detail = "offline", "No folders are set up yet"
+            elif paused:
+                state, detail = "paused", "Syncing is paused"
+            elif overall is not None:
+                s = overall.get("status")
+                if s == "syncing":
+                    state = "syncing"
+                    detail = f"{overall.get('pending', 0)} file(s) to go"
+                elif s == "error":
+                    state = "error"
+                    detail = f"{overall.get('errors', 0)} file(s) need attention"
+                else:
+                    state, detail = "synced", "Everything is up to date"
+            else:
+                state = "synced"
+                detail = ("Watching for changes"
+                          if eng.mode == syncengine.REALTIME
+                          else "Scheduled syncing")
+            self._tray.update(state, detail, paused=paused)
+
+        def _hide_to_tray_if_possible(self):
+            """Hide the window, but only when the tray can bring it back."""
+            if self._tray is None or not self._tray.running:
+                return False
+            try:
+                self.withdraw()
+            except Exception:
+                return False
+            self._hidden = True
+            self._sync_tray_state()
+            return True
+
+        def _show_from_tray(self):
+            self._hidden = False
+            try:
+                self.deiconify()
+                self.lift()
+                self.focus_force()
+            except Exception:
+                pass
+
+        def _tray_sync_now(self):
+            eng = self.engine
+            if eng is None:
+                return
+            try:
+                eng.sync_now()
+            except Exception:
+                pass
+
+        def _quit_from_tray(self):
+            self._quitting = True
+            self._on_close()
+
         # ---- lifecycle
         def _on_close(self):
+            """Closing the window keeps syncing in the tray, OneDrive-style.
+
+            Only an explicit Quit (tray menu, or the setting turned off) really
+            exits -- otherwise closing the window would silently stop syncing,
+            which is exactly the behaviour this feature exists to remove.
+            """
+            if not self._quitting and guiconfig.get_close_to_tray() \
+                    and self._hide_to_tray_if_possible():
+                return
             self._stop_engine()
+            if self._tray is not None:
+                self._tray.stop()
+                self._tray = None
             try:
                 self.destroy()
             except Exception:
@@ -1543,13 +1697,21 @@ def build_app():
     return App
 
 
-def main():
+def main(argv=None):
     """Entry point: build the root window and run.  Degrades on headless hosts.
+
+    ``--minimized`` starts hidden in the tray -- what the autostart entry uses
+    so a login does not throw a window at the user.
 
     Importing this module does nothing; only this function creates a Tk root.
     With no display (e.g. a server) or without customtkinter installed, it
     prints a friendly note and returns 0 instead of raising.
     """
+    global START_MINIMIZED
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--minimized" in args or "--tray" in args:
+        START_MINIMIZED = True
+
     try:
         import tkinter as tk
     except Exception as exc:  # tkinter missing entirely

@@ -36,7 +36,9 @@ def _defaults():
     return {"theme": "system", "recent": [], "pairs": [],
             "sync_mode": "realtime",
             "interval_minutes": DEFAULT_INTERVAL_MINUTES,
-            "daily_at": "", "paused": False}
+            "daily_at": "", "paused": False,
+            "close_to_tray": True, "start_minimized": False,
+            "autostart": False}
 
 
 def _clean_pairs(value):
@@ -75,6 +77,9 @@ def load():
             if isinstance(data.get("daily_at"), str):
                 cfg["daily_at"] = data["daily_at"]
             cfg["paused"] = bool(data.get("paused", False))
+            for key in ("close_to_tray", "start_minimized", "autostart"):
+                if key in data:
+                    cfg[key] = bool(data.get(key))
     except Exception:
         pass  # missing/corrupt -> defaults; never fatal
     return cfg
@@ -92,6 +97,9 @@ def save(cfg):
             "interval_minutes": cfg.get("interval_minutes", DEFAULT_INTERVAL_MINUTES),
             "daily_at": cfg.get("daily_at", "") if isinstance(cfg.get("daily_at"), str) else "",
             "paused": bool(cfg.get("paused", False)),
+            "close_to_tray": bool(cfg.get("close_to_tray", True)),
+            "start_minimized": bool(cfg.get("start_minimized", False)),
+            "autostart": bool(cfg.get("autostart", False)),
         }
         tmp = config_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -216,3 +224,36 @@ def _abs(p):
         return os.path.abspath(p)
     except Exception:
         return p
+
+
+def get_close_to_tray():
+    """True when closing the window should hide to the tray and keep syncing."""
+    return bool(load().get("close_to_tray", True))
+
+
+def set_close_to_tray(flag):
+    cfg = load()
+    cfg["close_to_tray"] = bool(flag)
+    save(cfg)
+
+
+def get_start_minimized():
+    """True when the app should start hidden in the tray (used at login)."""
+    return bool(load().get("start_minimized", False))
+
+
+def set_start_minimized(flag):
+    cfg = load()
+    cfg["start_minimized"] = bool(flag)
+    save(cfg)
+
+
+def get_autostart():
+    """The user's *preference*; :mod:`cloudsync.autostart` owns the real state."""
+    return bool(load().get("autostart", False))
+
+
+def set_autostart(flag):
+    cfg = load()
+    cfg["autostart"] = bool(flag)
+    save(cfg)

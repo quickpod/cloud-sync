@@ -3,3 +3,7 @@ customtkinter>=5.2
 darkdetect>=0.8
 # Realtime folder watching for the continuous-sync engine (Apache-2.0).
 watchdog>=3.0
+# Tray indicator: status badge + controls while the window is hidden (LGPL-3.0).
+# Optional at runtime — without it the app still syncs, but only while open.
+pystray>=0.19
+Pillow>=9.0
