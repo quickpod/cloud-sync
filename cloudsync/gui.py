@@ -1637,7 +1637,7 @@ def build_app():
                 on_toggle_pause=lambda: self._from_tray(self._toggle_pause),
                 on_settings=lambda: self._from_tray(self._tray_settings),
                 on_open_folder=lambda: self._from_tray(self._tray_open_folder),
-                on_quit=lambda: self._from_tray(self._quit_from_tray),
+                on_quit=self._tray_quit,
                 title=APP_NAME)
             if not self._tray.start():
                 self._tray = None
@@ -1723,9 +1723,52 @@ def build_app():
             if pairs:
                 open_in_file_manager(pairs[0].get("local", ""))
 
+        def _tray_quit(self):
+            """Quit from the tray, on the tray's own thread.
+
+            Marshalling this through after() like the other menu items is not
+            safe enough for Quit: if the Tk loop is busy -- mid-transfer, or
+            wedged -- the callback never runs and the menu item does nothing,
+            which is exactly when a user wants out. So the icon is stopped
+            here directly (the menu closes immediately, and the app stops
+            claiming to be running), the orderly teardown is asked for on the
+            Tk thread, and a watchdog guarantees the process actually exits.
+            """
+            self._quitting = True
+            tray_icon, self._tray = self._tray, None
+            if tray_icon is not None:
+                try:
+                    tray_icon.stop()
+                except Exception:
+                    pass
+            try:
+                self.after(0, self._quit_from_tray)
+            except Exception:
+                pass
+
+            def watchdog():
+                # Give the orderly path a few seconds to stop the engine and
+                # flush state; if it has not finished, leave anyway. A quit
+                # that does not quit is worse than an abrupt one.
+                import os as _os
+                _os._exit(0)
+
+            timer = threading.Timer(6.0, watchdog)
+            timer.daemon = True
+            timer.start()
+            self._quit_timer = timer
+
         def _quit_from_tray(self):
             self._quitting = True
             self._on_close()
+            # Orderly teardown finished: cancel the watchdog so a normal exit
+            # is not turned into a hard one.
+            timer = getattr(self, "_quit_timer", None)
+            if timer is not None:
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
 
         # ---- lifecycle
         def _on_close(self):
