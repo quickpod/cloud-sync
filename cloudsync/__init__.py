@@ -65,7 +65,7 @@ from .rclone import (
     validate_remote_name,
 )
 
-__version__ = "1.4.6"
+__version__ = "1.4.7"
 
 __all__ = [
     "CloudSyncError",
