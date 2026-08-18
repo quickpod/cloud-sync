@@ -646,17 +646,30 @@ def build_app():
                 if chosen:
                     local_e.delete(0, "end")
                     local_e.insert(0, chosen)
+                    suggest_rpath()
             aura.AuraButton(row, "Browse…", kind="secondary", height=30,
                             command=browse).pack(side="left", padx=(8, 0))
 
             aura.Caption(dlg.body, "Remote:").pack(anchor="w")
 
-            def remote_picked(name=None):
-                # a remote with a configured bucket starts inside that bucket
-                bucket = self._bucket_of(name or remote_o.get())
+            def suggest_rpath(_e=None):
+                """Default the remote path to <bucket>/<folder name>.
+
+                Pointing two folders at the same remote path makes each one
+                see the other's files as missing locally and download them, so
+                every folder ends up holding every folder's contents. Giving
+                each its own subfolder by default is what stops that.
+                """
+                bucket = self._bucket_of(remote_o.get())
+                local = paths.normalize_local(local_e.get().strip())
+                leaf = os.path.basename(local.rstrip(os.sep)) if local else ""
+                parts = [x for x in (bucket, leaf) if x]
                 rpath_e.delete(0, "end")
-                if bucket:
-                    rpath_e.insert(0, bucket + "/")
+                if parts:
+                    rpath_e.insert(0, "/".join(parts) + ("/" if not leaf else ""))
+
+            def remote_picked(name=None):
+                suggest_rpath()
 
             remote_o = aura.AuraOption(dlg.body, values=names, width=220,
                                        command=remote_picked)
@@ -667,6 +680,11 @@ def build_app():
             rpath_e = aura.AuraEntry(dlg.body,
                                      placeholder="bucket/folder …")
             rpath_e.pack(fill="x", pady=(4, 0))
+            aura.Caption(dlg.body,
+                         "Each folder needs its own remote path — two folders "
+                         "sharing one path will copy each other's files.").pack(
+                anchor="w", pady=(4, 0))
+            local_e.bind("<FocusOut>", suggest_rpath)
             remote_picked(names[0])
 
             def ok(_e=None):
@@ -675,8 +693,16 @@ def build_app():
                 if not local or not os.path.isdir(local):
                     self.set_error("Choose an existing local folder.")
                     return
+                remote_name = remote_o.get()
+                clash = self._pair_target_clash(remote_name, rp, local)
+                if clash:
+                    self.set_error(
+                        f"{clash} already syncs to that remote path. Two "
+                        f"folders sharing one path copy each other's files — "
+                        f"give this one its own subfolder.")
+                    return
                 dlg.close()
-                guiconfig.add_pair(local, remote_o.get(), rp)
+                guiconfig.add_pair(local, remote_name, rp)
                 guiconfig.add_recent(local)
                 self._start_engine()
                 self._folders_refresh()
@@ -685,6 +711,19 @@ def build_app():
             dlg.add_button("Start syncing", ok)
             dlg.add_button("Cancel", dlg.close, kind="secondary")
             self.after(120, local_e.focus_set)
+
+        def _pair_target_clash(self, remote, rpath, local):
+            """Name of an existing pair already using this remote path, if any."""
+            want = (rpath or "").strip("/")
+            for entry in guiconfig.get_pairs():
+                if entry.get("remote") != remote:
+                    continue
+                if (entry.get("rpath") or "").strip("/") != want:
+                    continue
+                if paths.normalize_local(entry.get("local", "")) == local:
+                    continue        # editing the same pair
+                return entry.get("local", "another folder")
+            return None
 
         # ---- settings (Ctrl+,)
         def _open_settings(self):
