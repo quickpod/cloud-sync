@@ -1597,6 +1597,8 @@ def build_app():
                 on_open=lambda: self._from_tray(self._show_from_tray),
                 on_sync_now=lambda: self._from_tray(self._tray_sync_now),
                 on_toggle_pause=lambda: self._from_tray(self._toggle_pause),
+                on_settings=lambda: self._from_tray(self._tray_settings),
+                on_open_folder=lambda: self._from_tray(self._tray_open_folder),
                 on_quit=lambda: self._from_tray(self._quit_from_tray),
                 title=APP_NAME)
             if not self._tray.start():
@@ -1669,6 +1671,19 @@ def build_app():
                 eng.sync_now()
             except Exception:
                 pass
+
+        def _tray_settings(self):
+            """Bring the window up and open Settings straight from the icon."""
+            self._show_from_tray()
+            try:
+                self._open_settings()
+            except Exception:
+                pass
+
+        def _tray_open_folder(self):
+            pairs = guiconfig.get_pairs()
+            if pairs:
+                open_in_file_manager(pairs[0].get("local", ""))
 
         def _quit_from_tray(self):
             self._quitting = True

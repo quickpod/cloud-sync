@@ -179,11 +179,15 @@ class TrayIcon:
     def __init__(self, *, on_open: Optional[Callable[[], None]] = None,
                  on_sync_now: Optional[Callable[[], None]] = None,
                  on_toggle_pause: Optional[Callable[[], None]] = None,
+                 on_settings: Optional[Callable[[], None]] = None,
+                 on_open_folder: Optional[Callable[[], None]] = None,
                  on_quit: Optional[Callable[[], None]] = None,
                  title: str = "Cloud Sync"):
         self._on_open = on_open
         self._on_sync_now = on_sync_now
         self._on_toggle_pause = on_toggle_pause
+        self._on_settings = on_settings
+        self._on_open_folder = on_open_folder
         self._on_quit = on_quit
         self._title = title
         self._state = DEFAULT_STATE
@@ -274,7 +278,17 @@ class TrayIcon:
             items.append(pystray.MenuItem(
                 "Resume syncing" if self._paused else "Pause syncing",
                 self._wrap(self._on_toggle_pause)))
+        if self._on_open_folder is not None:
+            items.append(pystray.MenuItem("Open synced folder",
+                                          self._wrap(self._on_open_folder)))
         if items:
+            items.append(pystray.Menu.SEPARATOR)
+        # Settings reachable from the icon: the app spends most of its life
+        # with no window, so the tray has to be a real entry point rather
+        # than a status light.
+        if self._on_settings is not None:
+            items.append(pystray.MenuItem("Settings…",
+                                          self._wrap(self._on_settings)))
             items.append(pystray.Menu.SEPARATOR)
         if self._on_quit is not None:
             items.append(pystray.MenuItem("Quit", self._wrap(self._on_quit)))
