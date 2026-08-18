@@ -537,10 +537,34 @@ class SyncEngine:
         """Newer wins; the losing version is KEPT as a conflicted copy."""
         remote_file = pair.remote_file(rel)
         if remote_m > local_m:
-            # remote is newer: local edition becomes the conflicted copy
+            # Remote is newer, so it takes the real name and the local edition
+            # is kept alongside it.
+            #
+            # The incoming copy is fetched to a temporary file FIRST and only
+            # swapped in once it is actually on disk. Moving the user's file
+            # out of the way before the replacement exists means any failure --
+            # a dropped connection, a deleted remote object, a full disk --
+            # leaves nothing at the real name. That is how a private key went
+            # missing: renamed away, and the download that was meant to replace
+            # it never landed.
+            incoming = local_path + ".cloudsync-incoming"
+            try:
+                rclone.copyto(remote_file, incoming)
+                if not os.path.exists(incoming):
+                    raise CloudSyncError("the remote copy did not download")
+            except Exception:
+                try:
+                    os.unlink(incoming)
+                except OSError:
+                    pass
+                # Nothing has moved: the local file is exactly as it was.
+                self._file_event(pair, rel, ERROR,
+                                 "could not fetch the newer cloud version — "
+                                 "your local file is untouched")
+                return
             keep = conflicted_name(local_path)
-            os.replace(local_path, keep)
-            rclone.copyto(remote_file, local_path)
+            os.replace(local_path, keep)      # only now, with the swap ready
+            os.replace(incoming, local_path)
             # the conflicted copy is a new local file — sync it too
             rel_keep = os.path.relpath(keep, pair.local).replace(os.sep, "/")
             rclone.copyto(keep, pair.remote_file(rel_keep))
