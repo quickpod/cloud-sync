@@ -30,6 +30,7 @@ through rclone.  100% AI-built, open source (quickopen.ai).
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -224,6 +226,13 @@ def iter_local_files(root_dir: str):
             yield full, rel
 
 
+@lru_cache(maxsize=512)
+def _pair_key(local: str, remote: str, rpath: str) -> str:
+    """Stable identity for a pair. Cached because it is read in hot loops."""
+    raw = f"{os.path.abspath(local)}|{remote}|{rpath}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class Pair:
     """One synced folder: a local directory mapped onto ``remote:path``."""
@@ -234,10 +243,13 @@ class Pair:
 
     @property
     def key(self) -> str:
-        """A filesystem-safe identity used for the state file name."""
-        raw = f"{os.path.abspath(self.local)}|{self.remote}|{self.rpath}"
-        import hashlib
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+        """A filesystem-safe identity used for the state file name.
+
+        Cached: this is read inside per-file loops in the UI, and recomputing
+        an abspath plus a SHA1 on every access made refreshing the folder list
+        cost more than the syncing did.
+        """
+        return _pair_key(self.local, self.remote, self.rpath)
 
     @property
     def label(self) -> str:
@@ -809,21 +821,12 @@ class SyncEngine:
             for pair in self.pairs:
                 if not os.path.isdir(pair.local):
                     continue
-                handler = _Handler(pair)
-                # Watch the top level recursively, but skip excluded trees
-                # entirely: .git and node_modules can be tens of thousands of
-                # directories, each costing an inotify watch and waking the
-                # observer for changes we would only discard.
-                obs.schedule(handler, pair.local, recursive=False)
-                for entry in os.scandir(pair.local):
-                    try:
-                        if not entry.is_dir(follow_symlinks=False):
-                            continue
-                    except OSError:
-                        continue
-                    if should_ignore_dir(entry.name):
-                        continue
-                    obs.schedule(handler, entry.path, recursive=True)
+                # One recursive watch per pair. Scheduling each subdirectory
+                # separately to skip excluded trees costs an emitter *thread*
+                # per call -- six pairs became eighty-eight threads, and the
+                # scheduling overhead outweighed the watches it avoided.
+                # Filtering in the handler is what actually removes the work.
+                obs.schedule(_Handler(pair), pair.local, recursive=True)
             obs.daemon = True
             obs.start()
             self._observer = obs

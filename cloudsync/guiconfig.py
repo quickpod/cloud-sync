@@ -53,8 +53,27 @@ def _clean_pairs(value):
     return out
 
 
+_cache = {"mtime": None, "size": None, "cfg": None}
+
+
 def load():
-    """Return the config dict, always with all known keys populated."""
+    """Return the config dict, always with all known keys populated.
+
+    The parsed result is cached against the file's mtime and size. This is
+    read on every UI refresh -- once per pair, per engine event -- and
+    re-opening and re-parsing the JSON each time was costing more CPU than the
+    syncing itself. A changed file is picked up on the next call, so an edit
+    made elsewhere is still honoured.
+    """
+    try:
+        st = os.stat(config_path())
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    if stamp is not None and _cache["cfg"] is not None \
+            and _cache["mtime"] == stamp[0] and _cache["size"] == stamp[1]:
+        # Copy: callers mutate what they get back (cfg["pairs"].append(...)).
+        return json.loads(_cache["cfg"])
     cfg = _defaults()
     try:
         with open(config_path(), "r", encoding="utf-8") as fh:
@@ -85,6 +104,9 @@ def load():
                 cfg["ignore_patterns"] = [p for p in pats if isinstance(p, str)]
     except Exception:
         pass  # missing/corrupt -> defaults; never fatal
+    if stamp is not None:
+        _cache["mtime"], _cache["size"] = stamp
+        _cache["cfg"] = json.dumps(cfg)
     return cfg
 
 
@@ -110,6 +132,7 @@ def save(cfg):
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(clean, fh, indent=2)
         os.replace(tmp, config_path())
+        _cache["mtime"] = _cache["size"] = _cache["cfg"] = None
     except Exception:
         pass
 

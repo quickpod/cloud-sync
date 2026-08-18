@@ -79,7 +79,7 @@ def test_activity_feed_and_chip(app, tmp_path):
                        "status": syncengine.SYNCING, "detail": "uploading"})
     app._engine_event({"kind": "overall", "status": "syncing",
                        "pending": 2, "errors": 0, "detail": ""})
-    _pump(app, 0.2)
+    _pump(app, 0.9)   # activity render is coalesced
     rows = app._act_tree.get_children()
     assert rows
     vals = app._act_tree.item(rows[0])["values"]
@@ -89,7 +89,7 @@ def test_activity_feed_and_chip(app, tmp_path):
                        "status": syncengine.ERROR, "detail": "boom"})
     app._engine_event({"kind": "overall", "status": "error",
                        "pending": 0, "errors": 1, "detail": ""})
-    _pump(app, 0.2)
+    _pump(app, 0.9)   # activity render is coalesced
     assert "error" in app._chip.cget("text")
 
 

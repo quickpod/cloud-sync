@@ -182,6 +182,9 @@ def build_app():
                 size=(1080, 720), min_size=(920, 620))
 
             self._busy = False
+            self._event_buf = []          # engine events awaiting one drain
+            self._event_job = None
+            self._event_lock = threading.Lock()
             self._img_refs_gui = []
             self._edit_name = None          # remote being edited (else None)
             self._browse_history = []       # path breadcrumbs for the Up button
@@ -333,9 +336,75 @@ def build_app():
                 self.engine = None
 
         def _engine_notify(self, event):
-            """Engine thread → UI thread."""
+            """Engine thread -> UI thread, batched.
+
+            A busy sync emits events far faster than they can be drawn, and one
+            after() callback per event floods the Tk loop: the main thread
+            spends its time dispatching callbacks rather than doing the work in
+            them. Events are collected and drained in one scheduled pass.
+            """
             try:
-                self.after(0, lambda: self._engine_event(event))
+                with self._event_lock:
+                    self._event_buf.append(event)
+                    already = self._event_job is not None
+                    if not already:
+                        self._event_job = True
+                if not already:
+                    self.after(60, self._drain_events)
+            except Exception:
+                pass
+
+        def _drain_events(self):
+            with self._event_lock:
+                events = self._event_buf
+                self._event_buf = []
+                self._event_job = None
+            for ev in events:
+                try:
+                    self._engine_event(ev)
+                except Exception:
+                    pass
+
+        def _schedule_activity_render(self):
+            """Rebuild the activity list a few times a second, not per event.
+
+            Every render clears and refills the tree, which makes the toolkit
+            repaint its frames. During a busy sync the events arrive far faster
+            than the list can be read, so the redraws were most of the CPU the
+            app used -- work thrown away before anyone could see it.
+            """
+            if getattr(self, "_activity_job", None) is not None:
+                return
+            try:
+                self._activity_job = self.after(500, self._do_activity_render)
+            except Exception:
+                self._activity_job = None
+
+        def _do_activity_render(self):
+            self._activity_job = None
+            try:
+                self._render_activity()
+            except Exception:
+                pass
+
+        def _schedule_status_refresh(self):
+            """Repaint the folder list at most a few times a second.
+
+            A busy sync emits events far faster than a human can read them;
+            refreshing per event spent the whole main thread redrawing rows
+            nobody had time to look at.
+            """
+            if getattr(self, "_status_job", None) is not None:
+                return
+            try:
+                self._status_job = self.after(400, self._do_status_refresh)
+            except Exception:
+                self._status_job = None
+
+        def _do_status_refresh(self):
+            self._status_job = None
+            try:
+                self._folders_refresh_status()
             except Exception:
                 pass
 
@@ -350,9 +419,9 @@ def build_app():
                 self._activity.insert(0, (pair.key, rel, status, detail,
                                           pair, _t.time()))
                 del self._activity[120:]
-                self._render_activity()
+                self._schedule_activity_render()
             self._update_chip(event if event.get("kind") == "overall" else None)
-            self._folders_refresh_status()
+            self._schedule_status_refresh()
 
         def _update_chip(self, overall=None):
             eng = self.engine
