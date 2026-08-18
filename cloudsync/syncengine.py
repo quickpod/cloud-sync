@@ -137,7 +137,11 @@ def should_ignore(name: str) -> bool:
     return False
 
 
-CONFLICT_RE = re.compile(r'(?: \(conflicted copy \d{4}-\d{2}-\d{2}\))+')
+#: The counter is optional: the first conflict of a day takes the plain name
+#: and every one after it is numbered, so leaving the counter out of this
+#: pattern would skip exactly the copies that accumulate.
+CONFLICT_RE = re.compile(
+    r'(?: \(conflicted copy \d{4}-\d{2}-\d{2}(?: \d+)?\))+')
 
 
 def _same_bytes(a: str, b: str, chunk: int = 1 << 16) -> bool:
@@ -175,7 +179,11 @@ def reconcile_conflicts(root_dir: str, remove_identical: bool = True):
     """
     restored = removed = 0
     kept = []
-    for dirpath, _dirs, files in os.walk(root_dir):
+    for dirpath, dirs, files in os.walk(root_dir):
+        # Prune what the sync itself never descends into. This pass renames
+        # and deletes, which is precisely the "acting on files that must never
+        # move" that iter_local_files prunes .git and friends to prevent.
+        dirs[:] = [d for d in dirs if not should_ignore_dir(d)]
         for name in sorted(files):
             if not CONFLICT_RE.search(name):
                 continue
