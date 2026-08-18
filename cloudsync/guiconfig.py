@@ -38,7 +38,7 @@ def _defaults():
             "interval_minutes": DEFAULT_INTERVAL_MINUTES,
             "daily_at": "", "paused": False,
             "close_to_tray": True, "start_minimized": False,
-            "autostart": False}
+            "autostart": False, "ignore_patterns": []}
 
 
 def _clean_pairs(value):
@@ -80,6 +80,9 @@ def load():
             for key in ("close_to_tray", "start_minimized", "autostart"):
                 if key in data:
                     cfg[key] = bool(data.get(key))
+            pats = data.get("ignore_patterns")
+            if isinstance(pats, list):
+                cfg["ignore_patterns"] = [p for p in pats if isinstance(p, str)]
     except Exception:
         pass  # missing/corrupt -> defaults; never fatal
     return cfg
@@ -100,6 +103,8 @@ def save(cfg):
             "close_to_tray": bool(cfg.get("close_to_tray", True)),
             "start_minimized": bool(cfg.get("start_minimized", False)),
             "autostart": bool(cfg.get("autostart", False)),
+            "ignore_patterns": [str(p) for p in cfg.get("ignore_patterns", [])
+                                if str(p).strip()],
         }
         tmp = config_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -256,4 +261,22 @@ def get_autostart():
 def set_autostart(flag):
     cfg = load()
     cfg["autostart"] = bool(flag)
+    save(cfg)
+
+
+#: Extra glob patterns the user wants excluded, on top of the built-in list.
+DEFAULT_IGNORE_PATTERNS = []
+
+
+def get_ignore_patterns():
+    """User-supplied exclusion globs (e.g. ``*.iso``, ``build/*``)."""
+    value = load().get("ignore_patterns", DEFAULT_IGNORE_PATTERNS)
+    return [p for p in value if isinstance(p, str) and p.strip()] \
+        if isinstance(value, list) else []
+
+
+def set_ignore_patterns(patterns):
+    cfg = load()
+    cfg["ignore_patterns"] = [str(p).strip() for p in (patterns or [])
+                              if str(p).strip()]
     save(cfg)

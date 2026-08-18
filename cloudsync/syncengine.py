@@ -29,6 +29,7 @@ through rclone.  100% AI-built, open source (quickopen.ai).
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import queue
@@ -59,20 +60,90 @@ DEBOUNCE_SECONDS = 1.5          # quiet window after a filesystem event
 POLL_SECONDS = 10               # local scan cadence without watchdog
 RECONCILE_SECONDS = 15 * 60     # remote reconcile cadence in realtime mode
 
-# Transient/junk files that editors and browsers leave around.
-IGNORE_SUFFIXES = (".tmp", ".temp", ".part", ".partial", ".swp", ".swx",
-                   ".crdownload", ".download")
+# Transient/junk files that editors, browsers and build tools leave around.
+# Syncing these wastes transfer, and worse, they change constantly, so they
+# generate endless spurious activity and conflicts.
+IGNORE_SUFFIXES = (".tmp", ".temp", ".part", ".partial", ".swp", ".swo",
+                   ".swx", ".crdownload", ".download", ".log", ".bak", ".old",
+                   ".pyc", ".pyo", ".class", ".o", ".obj", ".lock")
 IGNORE_PREFIXES = ("~$", ".~", ".#")
+#: Exact names, matched case-insensitively.
+IGNORE_NAMES = (".ds_store", "thumbs.db", "desktop.ini", ".directory",
+                "._.ds_store")
+
+#: Directories that are never descended into.  ``.git`` is the important one:
+#: its refs and objects are rewritten constantly, and a "conflicted copy" of
+#: HEAD or a branch ref silently corrupts the repository.  The rest are build
+#: and dependency caches that are reproducible and often enormous.
+IGNORE_DIRS = (".git", ".hg", ".svn", "__pycache__", "node_modules",
+               ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
+               ".gradle", ".idea", ".vscode", "target", ".next", ".cache",
+               ".Trash", "$RECYCLE.BIN", "System Volume Information")
+
+
+def _extra_patterns() -> tuple:
+    """User-supplied glob patterns from settings (never fatal if unreadable)."""
+    try:
+        from . import guiconfig
+        return tuple(guiconfig.get_ignore_patterns())
+    except Exception:
+        return ()
+
+
+def should_ignore_dir(name: str) -> bool:
+    """True for a directory that must not be traversed at all."""
+    base = os.path.basename(name.rstrip("/\\"))
+    if not base:
+        return False
+    return any(base.lower() == d.lower() for d in IGNORE_DIRS)
 
 
 def should_ignore(name: str) -> bool:
-    """True for transient files that must never be synced (pure)."""
-    base = os.path.basename(name)
-    if not base:
+    """True for a path that must never be synced (pure apart from settings).
+
+    Accepts either a bare filename or a relative path; any excluded directory
+    anywhere in the path excludes what is under it.
+    """
+    normalised = str(name or "").replace("\\", "/")
+    if not normalised:
         return True
+    parts = [p for p in normalised.split("/") if p not in ("", ".")]
+    if not parts:
+        return True
+    if any(should_ignore_dir(p) for p in parts[:-1]):
+        return True
+    base = parts[-1]
     low = base.lower()
-    return low.endswith(IGNORE_SUFFIXES) or \
-        any(base.startswith(p) for p in IGNORE_PREFIXES)
+    if low in IGNORE_NAMES:
+        return True
+    if low.endswith(IGNORE_SUFFIXES):
+        return True
+    if any(base.startswith(p) for p in IGNORE_PREFIXES):
+        return True
+    if should_ignore_dir(base):
+        return True
+    for pattern in _extra_patterns():
+        if fnmatch.fnmatch(low, pattern.lower()) or \
+                fnmatch.fnmatch(normalised.lower(), pattern.lower()):
+            return True
+    return False
+
+
+def iter_local_files(root_dir: str):
+    """Yield ``(full_path, rel_path)`` for every syncable file under *root_dir*.
+
+    Excluded directories are pruned rather than filtered afterwards: walking
+    into ``node_modules`` or ``.git`` to discard the results costs seconds on a
+    large tree and, for ``.git``, risks acting on files that must never move.
+    """
+    for root, dirs, files in os.walk(root_dir):
+        dirs[:] = [d for d in dirs if not should_ignore_dir(d)]
+        for name in files:
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, root_dir).replace(os.sep, "/")
+            if should_ignore(rel):
+                continue
+            yield full, rel
 
 
 @dataclass(frozen=True)
@@ -416,14 +487,35 @@ class SyncEngine:
             remote_changed = known_rm is not None and \
                 remote_info.mod_time != known_rm
             never_synced = entry is None
-            if remote_changed or never_synced:
-                same_size = remote_info.size == os.path.getsize(local_path)
-                if never_synced and same_size and abs(remote_m - local_m) < 2:
-                    pass          # identical enough — just record the state
-                else:
-                    self._resolve_conflict(pair, rel, local_path,
-                                           local_m, remote_m)
+            if never_synced:
+                # No prior state means we have never seen this file before --
+                # typically the first sync of a folder that already exists in
+                # the cloud. That is NOT evidence that both sides changed, and
+                # treating it as a conflict manufactures a "conflicted copy"
+                # for every pre-existing file. A cloud object's ModTime is
+                # when it was uploaded, so mtimes almost never agree and the
+                # old size+2s test almost never spared anything.
+                #
+                # Only genuinely differing content is a conflict here; matching
+                # size means adopt the remote's identity and move on.
+                if remote_info.size == os.path.getsize(local_path):
+                    self._record_synced(pair, rel, local_path, load_state(pair))
                     return
+                self._resolve_conflict(pair, rel, local_path,
+                                       local_m, remote_m)
+                return
+            if remote_changed:
+                # We synced this before and the remote has moved since. That is
+                # a real divergence only if the local side also changed; if it
+                # did not, the remote simply wins and we download.
+                local_changed = abs((entry or {}).get("lm", 0) - local_m) > 1e-6
+                if not local_changed:
+                    rclone.copyto(pair.remote_file(rel), local_path)
+                    self._record_synced(pair, rel, local_path, load_state(pair))
+                    return
+                self._resolve_conflict(pair, rel, local_path,
+                                       local_m, remote_m)
+                return
 
         # no conflict: local version wins → upload
         rclone.copyto(local_path, pair.remote_file(rel))
@@ -463,12 +555,19 @@ class SyncEngine:
 
     def _record_synced(self, pair: Pair, rel: str, local_path: str,
                        state: Dict[str, Dict], quiet: bool = False) -> None:
+        if not os.path.exists(local_path):
+            # Recording lm=0/size=0 for a missing file poisons the state: the
+            # remote then looks newer forever and the file re-conflicts on
+            # every pass. Leave the previous entry alone and report it instead.
+            self._file_event(pair, rel, ERROR,
+                             "local file disappeared before it could be recorded")
+            return
         info = rclone.stat_path(
             pair.remote, "/".join(p for p in (pair.rpath.strip("/"), rel) if p))
         state[rel] = {
-            "lm": os.path.getmtime(local_path) if os.path.exists(local_path) else 0,
+            "lm": os.path.getmtime(local_path),
             "rm": info.mod_time if info else "",
-            "size": os.path.getsize(local_path) if os.path.exists(local_path) else 0,
+            "size": os.path.getsize(local_path),
         }
         save_state(pair, state)
         if not quiet:
@@ -480,13 +579,11 @@ class SyncEngine:
             raise CloudSyncError(f"Local folder missing: {pair.local}")
         state = load_state(pair)
         local_files = {}
-        for root, _dirs, files in os.walk(pair.local):
-            for fn in files:
-                if should_ignore(fn):
-                    continue
-                full = os.path.join(root, fn)
-                rel = os.path.relpath(full, pair.local).replace(os.sep, "/")
+        for full, rel in iter_local_files(pair.local):
+            try:
                 local_files[rel] = os.path.getmtime(full)
+            except OSError:
+                continue
 
         # local news: new files or changed mtimes vs the recorded state
         for rel, lm in local_files.items():
@@ -585,17 +682,11 @@ class SyncEngine:
                 if not os.path.isdir(pair.local):
                     continue
                 snap = {}
-                for root, _dirs, files in os.walk(pair.local):
-                    for fn in files:
-                        if should_ignore(fn):
-                            continue
-                        full = os.path.join(root, fn)
-                        rel = os.path.relpath(full, pair.local).replace(
-                            os.sep, "/")
-                        try:
-                            snap[rel] = os.path.getmtime(full)
-                        except OSError:
-                            continue
+                for full, rel in iter_local_files(pair.local):
+                    try:
+                        snap[rel] = os.path.getmtime(full)
+                    except OSError:
+                        continue
                 prev = snapshots.get(pair.key)
                 if prev is not None:
                     for rel, m in snap.items():
