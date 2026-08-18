@@ -63,9 +63,16 @@ RECONCILE_SECONDS = 15 * 60     # remote reconcile cadence in realtime mode
 # Transient/junk files that editors, browsers and build tools leave around.
 # Syncing these wastes transfer, and worse, they change constantly, so they
 # generate endless spurious activity and conflicts.
+#: Where conflict resolution stages an incoming file before swapping it in.
+#: It lands inside the synced folder, and nothing suppresses the engine's own
+#: writes, so it MUST be ignored or the watcher uploads the half-written
+#: staging file and the next reconcile pulls the orphan back down.
+INCOMING_SUFFIX = ".cloudsync-incoming"
+
 IGNORE_SUFFIXES = (".tmp", ".temp", ".part", ".partial", ".swp", ".swo",
                    ".swx", ".crdownload", ".download", ".log", ".bak", ".old",
-                   ".pyc", ".pyo", ".class", ".o", ".obj", ".lock")
+                   ".pyc", ".pyo", ".class", ".o", ".obj", ".lock",
+                   INCOMING_SUFFIX)
 IGNORE_PREFIXES = ("~$", ".~", ".#")
 #: Exact names, matched case-insensitively.
 IGNORE_NAMES = (".ds_store", "thumbs.db", "desktop.ini", ".directory",
@@ -547,7 +554,7 @@ class SyncEngine:
             # leaves nothing at the real name. That is how a private key went
             # missing: renamed away, and the download that was meant to replace
             # it never landed.
-            incoming = local_path + ".cloudsync-incoming"
+            incoming = local_path + INCOMING_SUFFIX
             try:
                 rclone.copyto(remote_file, incoming)
                 if not os.path.exists(incoming):

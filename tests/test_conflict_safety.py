@@ -103,3 +103,16 @@ def test_no_incoming_temp_file_is_left_after_success(pair, monkeypatch):
         pair, "a.txt", target, local_m=1.0, remote_m=2.0)
     assert not any(n.endswith(".cloudsync-incoming")
                    for n in os.listdir(pair.local))
+
+
+def test_the_incoming_temp_file_is_never_syncable():
+    """The staging file must never be picked up as a file to sync.
+
+    The resolver stages the incoming version next to the real file, inside the
+    synced folder. Nothing suppresses the engine's own writes, so the realtime
+    watcher sees that staging file and, unless it is ignored, queues it: a
+    half-written temp file gets uploaded, the swap then removes it locally, and
+    the next reconcile pulls the orphan back down for good.
+    """
+    assert se.should_ignore("secret.key" + se.INCOMING_SUFFIX)
+    assert se.should_ignore("notes/report.txt" + se.INCOMING_SUFFIX)
