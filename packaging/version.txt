@@ -1,17 +1,17 @@
 # PyInstaller version resource — QuickOpen publisher metadata.
 VSVersionInfo(
-  ffi=FixedFileInfo(filevers=(1,3,1, 0), prodvers=(1,3,1, 0), mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)),
+  ffi=FixedFileInfo(filevers=(1,4,0, 0), prodvers=(1,4,0, 0), mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0,0)),
   kids=[
     StringFileInfo([
       StringTable('040904B0',
         [StringStruct('CompanyName', 'QuickOpen (quickopen.ai)'),
          StringStruct('FileDescription', 'Cloud Sync — offline QuickOpen tool'),
-         StringStruct('FileVersion', '1.3.1.0'),
+         StringStruct('FileVersion', '1.4.0.0'),
          StringStruct('InternalName', 'CloudSync'),
          StringStruct('LegalCopyright', 'Apache-2.0. 100% AI-built, published on QuickOpen.'),
          StringStruct('OriginalFilename', 'CloudSync.exe'),
          StringStruct('ProductName', 'Cloud Sync'),
-         StringStruct('ProductVersion', '1.3.1.0'),
+         StringStruct('ProductVersion', '1.4.0.0'),
          StringStruct('Comments', 'https://quickopen.ai/projects/cloud-sync')])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
