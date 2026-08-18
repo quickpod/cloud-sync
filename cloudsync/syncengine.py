@@ -32,6 +32,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import queue
 import threading
 import time
@@ -134,6 +135,68 @@ def should_ignore(name: str) -> bool:
                 fnmatch.fnmatch(normalised.lower(), pattern.lower()):
             return True
     return False
+
+
+CONFLICT_RE = re.compile(r'(?: \(conflicted copy \d{4}-\d{2}-\d{2}\))+')
+
+
+def _same_bytes(a: str, b: str, chunk: int = 1 << 16) -> bool:
+    """True when two files are byte-identical (size first, then content)."""
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                x, y = fa.read(chunk), fb.read(chunk)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+    except OSError:
+        return False
+
+
+def reconcile_conflicts(root_dir: str, remove_identical: bool = True):
+    """Tidy conflicted copies that turned out not to be conflicts.
+
+    Most "conflicted copy" files are not disagreements at all -- they are the
+    same bytes under a second name, left behind when resolution ran on a file
+    that had not really diverged. Every batch seen in the field has been
+    byte-identical to its original.
+
+    Three cases, and only the first two are safe to act on:
+
+    * the original is missing -- the copy IS the file, so restore its name;
+    * the original is present and identical -- the copy is noise, delete it;
+    * the original is present and differs -- a real conflict, leave it alone
+      and report it, because only the user can say which version they want.
+
+    Returns ``(restored, removed, kept)``.
+    """
+    restored = removed = 0
+    kept = []
+    for dirpath, _dirs, files in os.walk(root_dir):
+        for name in sorted(files):
+            if not CONFLICT_RE.search(name):
+                continue
+            src = os.path.join(dirpath, name)
+            dst = os.path.join(dirpath, CONFLICT_RE.sub("", name))
+            if not os.path.exists(dst):
+                try:
+                    os.rename(src, dst)
+                    restored += 1
+                except OSError:
+                    pass
+                continue
+            if remove_identical and _same_bytes(src, dst):
+                try:
+                    os.remove(src)
+                    removed += 1
+                except OSError:
+                    pass
+            else:
+                kept.append(src)
+    return restored, removed, kept
 
 
 def iter_local_files(root_dir: str):
@@ -619,6 +682,23 @@ class SyncEngine:
     def _reconcile_pair(self, pair: Pair) -> None:
         if not os.path.isdir(pair.local):
             raise CloudSyncError(f"Local folder missing: {pair.local}")
+        # Clear conflicted copies that are not actually conflicts before
+        # scanning, or they get treated as ordinary new files and uploaded.
+        try:
+            restored, removed, kept = reconcile_conflicts(pair.local)
+            if restored or removed:
+                self._notify({"kind": "info", "pair": pair,
+                              "text": f"tidied {restored + removed} conflicted "
+                                      f"copy(ies)"})
+            for path in kept:
+                self._file_event(
+                    pair,
+                    os.path.relpath(path, pair.local).replace(os.sep, "/"),
+                    CONFLICT,
+                    "both versions differ — keeping this copy for you to check")
+        except Exception:
+            pass          # tidying must never stop a sync
+
         state = load_state(pair)
         local_files = {}
         for full, rel in iter_local_files(pair.local):
