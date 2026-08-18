@@ -761,15 +761,27 @@ class SyncEngine:
         engine = self
 
         class _Handler(FileSystemEventHandler):
+            """Filesystem events, filtered before they cost anything.
+
+            The exclusion list was applied when scanning but not to events, so
+            everything inside .git, __pycache__, node_modules and every .tmp
+            was queued -- and each queued path spawns an rclone process to
+            stat the remote. One `git status` or Python run produced hundreds
+            of them, which is why the machine ran hot while apparently idle.
+            """
+
             def __init__(self, pair):
                 self.pair = pair
 
             def _rel(self, src):
                 try:
-                    return os.path.relpath(src, self.pair.local).replace(
+                    rel = os.path.relpath(src, self.pair.local).replace(
                         os.sep, "/")
                 except Exception:
                     return None
+                if rel.startswith("..") or should_ignore(rel):
+                    return None
+                return rel
 
             def on_created(self, event):
                 if not event.is_directory:
@@ -795,8 +807,23 @@ class SyncEngine:
         try:
             obs = Observer()
             for pair in self.pairs:
-                if os.path.isdir(pair.local):
-                    obs.schedule(_Handler(pair), pair.local, recursive=True)
+                if not os.path.isdir(pair.local):
+                    continue
+                handler = _Handler(pair)
+                # Watch the top level recursively, but skip excluded trees
+                # entirely: .git and node_modules can be tens of thousands of
+                # directories, each costing an inotify watch and waking the
+                # observer for changes we would only discard.
+                obs.schedule(handler, pair.local, recursive=False)
+                for entry in os.scandir(pair.local):
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    if should_ignore_dir(entry.name):
+                        continue
+                    obs.schedule(handler, entry.path, recursive=True)
             obs.daemon = True
             obs.start()
             self._observer = obs
