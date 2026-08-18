@@ -633,7 +633,7 @@ def build_app():
                 self.show("remotes")
                 return
             dlg = aura.Dialog(self, title="Add synced folder",
-                              size=(520, 330))
+                              size=(520, 400))
             aura.Caption(dlg.body, "Local folder:").pack(anchor="w")
             row = ctk.CTkFrame(dlg.body, fg_color="transparent")
             row.pack(fill="x", pady=(4, 10))
@@ -681,8 +681,7 @@ def build_app():
                                      placeholder="bucket/folder …")
             rpath_e.pack(fill="x", pady=(4, 0))
             aura.Caption(dlg.body,
-                         "Each folder needs its own remote path — two folders "
-                         "sharing one path will copy each other's files.").pack(
+                         "Each folder gets its own subfolder.").pack(
                 anchor="w", pady=(4, 0))
             local_e.bind("<FocusOut>", suggest_rpath)
             remote_picked(names[0])
