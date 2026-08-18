@@ -52,8 +52,8 @@ def app(tmp_path_factory):
 def test_folders_is_home_with_empty_state(app):
     assert app.active_section == "folders"
     assert not app._pairs_tree.get_children()
-    # six curated pills, About included
-    assert len(gui.VIEWS) == 6
+    # seven curated pills, Help and About included
+    assert len(gui.VIEWS) == 7
     assert gui.VIEWS[0][0] == "folders"
 
 

@@ -1741,11 +1741,6 @@ def build_app():
                     tray_icon.stop()
                 except Exception:
                     pass
-            try:
-                self.after(0, self._quit_from_tray)
-            except Exception:
-                pass
-
             def watchdog():
                 # Give the orderly path a few seconds to stop the engine and
                 # flush state; if it has not finished, leave anyway. A quit
@@ -1753,10 +1748,20 @@ def build_app():
                 import os as _os
                 _os._exit(0)
 
+            # The watchdog is armed BEFORE the Tk call below, not after: a
+            # tkinter call from this thread blocks on the Tcl interpreter lock
+            # for as long as the Tk loop is busy. Arming it afterwards means a
+            # wedged loop -- the whole reason this path exists -- stops the
+            # watchdog from ever being scheduled, and Quit hangs exactly as it
+            # did before.
             timer = threading.Timer(6.0, watchdog)
             timer.daemon = True
             timer.start()
             self._quit_timer = timer
+            try:
+                self.after(0, self._quit_from_tray)
+            except Exception:
+                pass
 
         def _quit_from_tray(self):
             self._quitting = True
