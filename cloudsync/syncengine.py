@@ -509,9 +509,20 @@ class SyncEngine:
                 # a real divergence only if the local side also changed; if it
                 # did not, the remote simply wins and we download.
                 local_changed = abs((entry or {}).get("lm", 0) - local_m) > 1e-6
-                if not local_changed:
+                if not local_changed and remote_m >= local_m:
                     rclone.copyto(pair.remote_file(rel), local_path)
                     self._record_synced(pair, rel, local_path, load_state(pair))
+                    return
+                if not local_changed:
+                    # The remote moved but is OLDER than what is on disk — a
+                    # restore from an old backup, a clock-skewed writer, a
+                    # rolled-back object. Downloading here would overwrite a
+                    # newer local file with an older one and upload nothing:
+                    # silent data loss, which is the one thing this engine
+                    # promises never to do. Newer still wins, and the loser is
+                    # kept as a conflicted copy.
+                    self._resolve_conflict(pair, rel, local_path,
+                                           local_m, remote_m)
                     return
                 self._resolve_conflict(pair, rel, local_path,
                                        local_m, remote_m)

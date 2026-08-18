@@ -1,6 +1,6 @@
 ; Inno Setup — Cloud Sync. Signed single-file installer, compiled in CI.
 #define AppName "Cloud Sync"
-#define AppVersion "1.2.0"
+#define AppVersion "1.3.0"
 
 [Setup]
 AppMutex=QuickOpen.CloudSync
@@ -24,7 +24,7 @@ WizardSmallImageFile=branding\wizard-small.bmp
 AppCopyright=Apache-2.0. 100%% AI-built, published on QuickOpen (quickopen.ai).
 VersionInfoCompany=QuickOpen
 VersionInfoProductName=Cloud Sync
-VersionInfoVersion=1.2.0.0
+VersionInfoVersion=1.3.0.0
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesInstallIn64BitMode=x64compatible
