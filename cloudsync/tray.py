@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from typing import Callable, Dict, Optional
 
 try:  # optional dependency -- the app must run without a tray
@@ -34,6 +35,10 @@ except Exception as exc:  # pragma: no cover - depends on the host
 
 ICON_SIZE = 64
 ICON_FILE = "cloud-sync.png"
+#: A busy sync flips between "syncing" and "synced" many times a second. Below
+#: this interval the icon is left alone: a blinking tray entry reads as a fault
+#: and is hard to aim at.
+MIN_ICON_INTERVAL = 2.0
 
 #: Overall states the engine reports, mapped to what the tray should show.
 #: Colours read against both light and dark panels.
@@ -196,6 +201,9 @@ class TrayIcon:
         self._icon = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
+        self._last_icon_at = 0.0
+        self._last_icon_state = None
+        self._settle_job = None
 
     # -- lifecycle -------------------------------------------------------- #
     def start(self) -> bool:
@@ -237,21 +245,75 @@ class TrayIcon:
 
     # -- state ------------------------------------------------------------ #
     def update(self, state: str, detail: str = "", *, paused: bool = False):
-        """Set the indicator's state, tooltip detail and pause flag."""
+        """Set the indicator's state, tooltip detail and pause flag.
+
+        Only what actually changed is pushed to the tray. Reassigning the icon
+        image on every sync event makes it flicker, and rebuilding the *menu*
+        that often tears it down under the pointer -- the menu becomes
+        impossible to click while a sync is running, which is exactly when a
+        user reaches for it.
+        """
         with self._lock:
-            self._state = state if state in STATE_STYLE else DEFAULT_STATE
-            self._detail = detail or ""
-            self._paused = bool(paused)
+            state = state if state in STATE_STYLE else DEFAULT_STATE
+            paused = bool(paused)
+            detail = detail or ""
+            icon_changed = (state != self._state) or (paused != self._paused)
+            # The menu's text depends only on the pause flag.
+            menu_changed = paused != self._paused
+            tip_changed = (icon_changed or detail != self._detail)
+            self._state, self._detail, self._paused = state, detail, paused
         icon = self._icon
         if icon is None:
             return
         try:
-            icon.icon = render_icon(self._state)
-            icon.title = self._tooltip()
-            icon.menu = self._build_menu()
-            icon.update_menu()
+            if tip_changed:
+                icon.title = self._tooltip()      # cheap, never flickers
+            if menu_changed:
+                icon.menu = self._build_menu()
+                icon.update_menu()
+            if icon_changed:
+                self._set_icon_image()
         except Exception:
             pass
+
+    def _set_icon_image(self) -> None:
+        """Repaint the tray image, rate-limited so it cannot strobe.
+
+        A held-back change is not dropped: a timer applies the final state
+        once things settle, so the icon always ends up telling the truth.
+        """
+        icon = self._icon
+        if icon is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            target = (self._state, self._paused)
+            if target == self._last_icon_state:
+                return
+            due = now - self._last_icon_at >= MIN_ICON_INTERVAL
+        if due:
+            with self._lock:
+                self._last_icon_at = now
+                self._last_icon_state = target
+            try:
+                icon.icon = render_icon(self._state)
+            except Exception:
+                pass
+            return
+        # Too soon: schedule one catch-up rather than a burst of repaints.
+        with self._lock:
+            if self._settle_job is not None:
+                return
+            delay = MIN_ICON_INTERVAL - (now - self._last_icon_at)
+            timer = threading.Timer(max(0.1, delay), self._settle)
+            timer.daemon = True
+            self._settle_job = timer
+        timer.start()
+
+    def _settle(self) -> None:
+        with self._lock:
+            self._settle_job = None
+        self._set_icon_image()
 
     @property
     def state(self) -> str:
