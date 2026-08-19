@@ -95,6 +95,31 @@ PROVIDERS: Tuple[Provider, ...] = (
              "Any endpoint that speaks the S3 API."),
 )
 
+#: Cloudflare R2 answers a PUT with an ``x-amz-version-id`` header even when
+#: the bucket is unversioned.  rclone takes that at face value and reads the
+#: object back with ``HEAD ...?versionId=``, which R2 does not implement, so
+#: it replies 501 and rclone reports the upload as failed.  The object is
+#: already stored at that point -- the retry "succeeds" only because it finds
+#: the file present -- so the data is fine and every first upload of a file
+#: still surfaces as an error.  ``no_head`` skips that read-back.
+R2_ENDPOINT_HOST_SUFFIX = "r2.cloudflarestorage.com"
+NO_HEAD_KEY = "no_head"
+
+
+def is_r2_endpoint(endpoint: str) -> bool:
+    """True when *endpoint* addresses Cloudflare R2.
+
+    Matched on the endpoint host rather than the ``provider`` key, because a
+    remote can be pointed at R2 while carrying any provider value -- including
+    ``AWS``, which is what a hand-written or imported config often says.
+    """
+    host = (endpoint or "").strip().lower()
+    host = host.split("://", 1)[-1].split("/", 1)[0].split("@")[-1]
+    host = host.split(":")[0]
+    return host == R2_ENDPOINT_HOST_SUFFIX or host.endswith(
+        "." + R2_ENDPOINT_HOST_SUFFIX)
+
+
 PROVIDERS_BY_KEY: Dict[str, Provider] = {p.key: p for p in PROVIDERS}
 _PROVIDER_BY_RCLONE = {p.rclone_provider: p for p in reversed(PROVIDERS)}
 
@@ -332,6 +357,8 @@ def build_remote_section(
         params["region"] = region
     if bucket:
         params[BUCKET_KEY] = bucket
+    if prov.key == "r2" or is_r2_endpoint(endpoint):
+        params[NO_HEAD_KEY] = "true"
     return Remote(name=name, params=params)
 
 
@@ -661,9 +688,33 @@ def _migrate_obscured_secrets(remotes: List[Remote]) -> List[Remote]:
     return remotes
 
 
+def _migrate_r2_no_head(remotes: List[Remote]) -> List[Remote]:
+    """Add ``no_head`` to R2 remotes written before it was set, in place.
+
+    Same shape as :func:`_migrate_obscured_secrets`: remotes configured by an
+    older version keep failing every first upload until the key is present,
+    and the user has no way to reach it from the UI.  Runs at most once --
+    once written, the key is there.  A read-only config is not fatal; the
+    value is still returned so the session behaves correctly.
+    """
+    changed = False
+    for remote in remotes:
+        if (is_r2_endpoint(remote.params.get("endpoint", ""))
+                and NO_HEAD_KEY not in remote.params):
+            remote.params[NO_HEAD_KEY] = "true"
+            changed = True
+    if changed:
+        try:
+            save_remotes(remotes)
+        except CloudSyncError:
+            pass
+    return remotes
+
+
 def list_remotes() -> List[Remote]:
     """Return every configured remote (read from Cloud Sync's rclone.conf)."""
-    return _migrate_obscured_secrets(parse_config(_read_config_text()))
+    return _migrate_r2_no_head(
+        _migrate_obscured_secrets(parse_config(_read_config_text())))
 
 
 def remote_names() -> List[str]:
