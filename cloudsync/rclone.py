@@ -839,6 +839,14 @@ def stat_path(remote_name: str, path: str) -> Optional[Entry]:
         return None
     if not isinstance(item, dict):
         return None
+    # On an S3 backend `lsjson --stat` does NOT fail for a missing object: it
+    # succeeds and describes a phantom directory with an empty Name and Path,
+    # Size -1, and ModTime set to *now*. Parsed naively that reads as "the
+    # remote has this file and it is newer than yours", which sends the engine
+    # into conflict resolution for a file that is not there -- and the fetch
+    # that follows can only fail. An entry with no name is not an object.
+    if not (item.get("Name") or item.get("Path")):
+        return None
     entries = parse_lsjson(json.dumps([item]))
     return entries[0] if entries else None
 
