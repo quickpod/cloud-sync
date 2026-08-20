@@ -1,6 +1,6 @@
 ; Inno Setup — Cloud Sync. Signed single-file installer, compiled in CI.
 #define AppName "Cloud Sync"
-#define AppVersion "1.4.8"
+#define AppVersion "1.4.10"
 
 [Setup]
 AppMutex=QuickOpen.CloudSync
