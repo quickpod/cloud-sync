@@ -30,7 +30,7 @@ from cloudsync import (
     sanitize_endpoint,
     validate_remote_name,
 )
-from cloudsync import paths, rclone
+from cloudsync import paths, rclone, syncengine
 
 # Reserved documentation endpoints — never routable, never a real service.
 MINIO_ENDPOINT = "https://192.0.2.10:9000"
@@ -575,3 +575,41 @@ def test_public_api_surface():
                  "PROVIDERS", "paths", "sanitize_endpoint",
                  "friendly_test_error", "BUCKET_KEY"):
         assert hasattr(cloudsync, name)
+
+
+# --------------------------------------------------------------------------- #
+# The freedesktop trash on a secondary volume must never be uploaded.
+#
+# IGNORE_DIRS listed ".Trash", the spelling used only at the top of the user's
+# own filesystem.  Every other mounted volume names it ".Trash-<uid>", so the
+# trash on a removable or secondary disk was synced like ordinary data.
+# Reported from the field as an error naming
+# ".Trash-1000/files/efi-backup-2026-08-14/RESTORE.md" -- a file the user never
+# chose to sync, which the desktop deleted mid-transfer, leaving rclone to
+# report the transfer corrupted.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("name", [
+    ".Trash", ".Trash-1000", ".Trash-0", ".trash-1000", ".TRASH-1000",
+])
+def test_uid_suffixed_trash_is_ignored(name):
+    assert syncengine.should_ignore_dir(name)
+    assert syncengine.should_ignore(name)
+
+
+@pytest.mark.parametrize("path", [
+    ".Trash-1000/files/efi-backup-2026-08-14/RESTORE.md",
+    ".Trash-1000/info/thing.trashinfo",
+    "sub/.Trash-1000/files/deep/x.bin",
+])
+def test_contents_of_trash_are_ignored(path):
+    assert syncengine.should_ignore(path)
+
+
+@pytest.mark.parametrize("path", [
+    "Trash-notes.md", "my.Trash-file.txt", "Documents/trash-report.md",
+    ".Trashy/keep.md", "trash.md",
+])
+def test_ordinary_names_are_not_swept_up(path):
+    """The prefix rule must not swallow real user files."""
+    assert not syncengine.should_ignore(path)

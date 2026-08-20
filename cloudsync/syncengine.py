@@ -100,12 +100,31 @@ def _extra_patterns() -> tuple:
         return ()
 
 
+#: Directory-name PREFIXES that are never descended into.
+#:
+#: ``.Trash-`` is the important one.  The freedesktop trash is called
+#: ``.Trash`` only at the top of the user's own filesystem; on every other
+#: mounted volume it is ``.Trash-<uid>`` -- ``.Trash-1000`` in practice.  An
+#: exact-name list matched the spelling that rarely appears inside a synced
+#: folder and missed the one that routinely does, so the trash on a removable
+#: or secondary volume was uploaded as if it were ordinary data.
+#:
+#: Wasted transfer is the least of it.  The desktop creates and removes files
+#: in there constantly, so one can vanish between being listed and being read
+#: -- which surfaces as rclone reporting the transfer corrupted, naming a file
+#: the user never chose to sync and can no longer find.
+IGNORE_DIR_PREFIXES = (".trash-",)
+
+
 def should_ignore_dir(name: str) -> bool:
     """True for a directory that must not be traversed at all."""
     base = os.path.basename(name.rstrip("/\\"))
     if not base:
         return False
-    return any(base.lower() == d.lower() for d in IGNORE_DIRS)
+    low = base.lower()
+    if any(low == d.lower() for d in IGNORE_DIRS):
+        return True
+    return any(low.startswith(p) for p in IGNORE_DIR_PREFIXES)
 
 
 def should_ignore(name: str) -> bool:
